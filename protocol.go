@@ -1,0 +1,498 @@
+//go:build cgo
+
+package figram
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// The typed engine protocol, version 1 (docs/format.md, section 8, in the Figram repository).
+// Every reply is checked strictly: the id echo, exactly one reply variant, the field types and
+// value ranges; a reply that breaks the protocol is an error, never a partial result.
+
+// MaxInt is the largest integer of the protocol (2^53 − 1): tokens, delays and seq.
+const MaxInt = 1<<53 - 1
+
+// Snapshot is the state of one user, kept by the host between events (in a database, for
+// example) and passed back with the next request. Store it as its JSON encoding; the engine
+// rejects unknown fields.
+type Snapshot struct {
+	V      int               `json:"v,omitempty"`      // version; 0 means 1
+	At     string            `json:"at"`               // the current message
+	Resume map[string]string `json:"resume,omitempty"` // section → message: the places "resume" leads to
+	Timers map[string]uint64 `json:"timers,omitempty"` // timer → token: the active timers
+	Seq    uint64            `json:"seq,omitempty"`    // the number of the last transition
+}
+
+// ActionKind is the kind of an [Action].
+type ActionKind string
+
+// The actions the host executes, in the order of [Result.Actions].
+const (
+	Send        ActionKind = "send"         // send the message Name to the user
+	Call        ActionKind = "call"         // run the action Name of the host
+	StartTimer  ActionKind = "start_timer"  // start the timer Name for Ms milliseconds with Token
+	CancelTimer ActionKind = "cancel_timer" // cancel the timer Name
+)
+
+// Action is one action of a transition.
+type Action struct {
+	Kind  ActionKind
+	Name  string // the message (Send), the action (Call) or the timer (StartTimer, CancelTimer)
+	Ms    uint64 // StartTimer: the delay in milliseconds
+	Token uint64 // StartTimer: the token to pass to [Bot.Timer] when the timer fires
+}
+
+// MarshalJSON writes the protocol form, e.g. {"start_timer":"t","ms":5000,"token":3}.
+func (a Action) MarshalJSON() ([]byte, error) {
+	switch a.Kind {
+	case Send, Call, CancelTimer:
+		return json.Marshal(map[string]string{string(a.Kind): a.Name})
+	case StartTimer:
+		return json.Marshal(struct {
+			Name  string `json:"start_timer"`
+			Ms    uint64 `json:"ms"`
+			Token uint64 `json:"token"`
+		}{a.Name, a.Ms, a.Token})
+	}
+	return nil, fmt.Errorf("figram: unknown action kind %q", a.Kind)
+}
+
+// UnmarshalJSON reads the protocol form strictly.
+func (a *Action) UnmarshalJSON(b []byte) error {
+	v, err := decodeJSON(b)
+	if err != nil {
+		return err
+	}
+	if err := checkAction(v); err != nil {
+		return err
+	}
+	*a = toAction(v.(map[string]any))
+	return nil
+}
+
+// Result is the reply to [Bot.Start], [Bot.Restart], [Bot.Step] and [Bot.Timer].
+type Result struct {
+	// Need is set only by a step whose choice depends on conditions that were not given: repeat
+	// the same step with their values added to the guards (see [Decide]). Snapshot and Actions
+	// are empty then.
+	Need []string
+	// Snapshot is the new state of the user: store it, then execute Actions.
+	Snapshot Snapshot
+	// Actions are executed by the host in this order.
+	Actions []Action
+	// Recovered: the snapshot's message is not in the document (it was edited), so the user was
+	// started over; the event of the request was not processed.
+	Recovered bool
+}
+
+// MarshalJSON writes the protocol form of the reply: {"need": [...]} or {"snapshot": ...,
+// "actions": [...]} with "recovered": true when set.
+func (r Result) MarshalJSON() ([]byte, error) {
+	if len(r.Need) > 0 {
+		return json.Marshal(map[string]any{"need": r.Need})
+	}
+	m := map[string]any{"snapshot": r.Snapshot, "actions": r.Actions}
+	if r.Actions == nil {
+		m["actions"] = []Action{}
+	}
+	if r.Recovered {
+		m["recovered"] = true
+	}
+	return json.Marshal(m)
+}
+
+// Hello is the reply to [Bot.Hello].
+type Hello struct {
+	Protocol int // the protocol version: 1
+	States   int // the number of messages of the document
+}
+
+// The error codes of the protocol; hosts decide by the code, not by the text.
+const (
+	CodeParseError  = "parse_error"  // the request is not JSON, not UTF-8, or too deep
+	CodeTooLarge    = "too_large"    // the request is longer than the limit ([SetMaxRequest])
+	CodeBadRequest  = "bad_request"  // a wrong field: an empty event, a token without a timer event, ...
+	CodeBadSnapshot = "bad_snapshot" // the snapshot is not accepted
+	CodeSeqOverflow = "seq_overflow" // the new seq would exceed MaxInt
+)
+
+var errorCodes = map[string]bool{
+	CodeParseError: true, CodeTooLarge: true, CodeBadRequest: true, CodeBadSnapshot: true, CodeSeqOverflow: true,
+}
+
+// ProtocolError is an error reply of the engine. The snapshot of the request is unchanged, and
+// repeating the same request gives the same error.
+type ProtocolError struct {
+	Code    string // one of the Code constants
+	Message string // for humans; it may change between versions
+}
+
+func (e *ProtocolError) Error() string { return "figram: " + e.Code + ": " + e.Message }
+
+// Hello returns the protocol version and the number of messages of the document.
+func (b *Bot) Hello() (Hello, error) {
+	r, err := b.call("hello", nil)
+	if err != nil {
+		return Hello{}, err
+	}
+	return Hello{Protocol: toInt(r["protocol"]), States: toInt(r["states"])}, nil
+}
+
+// Start enters the bot for a new user. seq is the user's high-water mark: the largest seq ever
+// issued to this user, or 0 for a user who never had a snapshot. Starting an existing user over
+// from 0 gives new actions the idempotency keys of old ones (docs/host-contract.md); use
+// [Bot.Restart] with the user's snapshot instead.
+func (b *Bot) Start(seq uint64) (*Result, error) {
+	f := map[string]any{}
+	if seq != 0 {
+		f["seq"] = seq
+	}
+	return b.result("start", f)
+}
+
+// Restart starts the user over: it cancels the snapshot's timers, clears the remembered places
+// and enters the bot again, continuing the seq counter.
+func (b *Bot) Restart(s Snapshot) (*Result, error) {
+	return b.result("restart", map[string]any{"snapshot": s})
+}
+
+// Step processes the event (for example "btn:order") for the user in snapshot s. guards holds
+// the values of conditions the host already knows; nil is allowed. If the choice depends on
+// other conditions, the result has only Need set (see [Decide]).
+func (b *Bot) Step(s Snapshot, event string, guards map[string]bool) (*Result, error) {
+	f := map[string]any{"snapshot": s, "event": event}
+	if len(guards) > 0 {
+		f["guards"] = guards
+	}
+	return b.result("step", f)
+}
+
+// Timer processes the firing of a timer started by a [StartTimer] action: timer is its Name and
+// token its Token. A firing with a stale token, or after the user left the message, changes
+// nothing (the result has the same snapshot and no actions).
+func (b *Bot) Timer(s Snapshot, timer string, token uint64, guards map[string]bool) (*Result, error) {
+	f := map[string]any{"snapshot": s, "event": "timer:" + timer, "token": token}
+	if len(guards) > 0 {
+		f["guards"] = guards
+	}
+	return b.result("step", f)
+}
+
+// Decide runs step until it returns a result without Need, evaluating every needed condition
+// once with eval and passing the values collected so far to the next call of step. guards are
+// the values known in advance (they are not modified). For example:
+//
+//	res, err := figram.Decide(nil, conditionHolds, func(g map[string]bool) (*figram.Result, error) {
+//		return bot.Step(snap, "btn:checkout", g)
+//	})
+func Decide(guards map[string]bool, eval func(condition string) (bool, error),
+	step func(guards map[string]bool) (*Result, error)) (*Result, error) {
+	known := make(map[string]bool, len(guards))
+	for k, v := range guards {
+		known[k] = v
+	}
+	for {
+		r, err := step(known)
+		if err != nil || len(r.Need) == 0 {
+			return r, err
+		}
+		for _, c := range r.Need {
+			if _, ok := known[c]; ok {
+				// The engine never asks again for a given condition: this would loop forever.
+				return nil, fmt.Errorf("figram: the engine asked again for condition %q", c)
+			}
+			v, err := eval(c)
+			if err != nil {
+				return nil, err
+			}
+			known[c] = v
+		}
+	}
+}
+
+func (b *Bot) result(op string, fields map[string]any) (*Result, error) {
+	r, err := b.call(op, fields)
+	if err != nil {
+		return nil, err
+	}
+	if need, ok := r["need"]; ok {
+		res := &Result{}
+		for _, c := range need.([]any) {
+			res.Need = append(res.Need, c.(string))
+		}
+		return res, nil
+	}
+	res := &Result{Snapshot: toSnapshot(r["snapshot"].(map[string]any)), Recovered: r["recovered"] == true}
+	for _, a := range r["actions"].([]any) {
+		res.Actions = append(res.Actions, toAction(a.(map[string]any)))
+	}
+	return res, nil
+}
+
+// call sends op with fields and a fresh id and returns the checked reply without the id, or the
+// error reply as a *ProtocolError.
+func (b *Bot) call(op string, fields map[string]any) (map[string]any, error) {
+	id := b.nextID.Add(1)
+	msg := make(map[string]any, len(fields)+2)
+	for k, v := range fields {
+		msg[k] = v
+	}
+	msg["op"] = op
+	msg["id"] = id
+	line, err := json.Marshal(msg)
+	if err != nil {
+		return nil, fmt.Errorf("figram: request cannot be encoded: %w", err)
+	}
+	out, err := b.Request(line)
+	if err != nil {
+		return nil, err
+	}
+	v, err := decodeJSON(out)
+	if err != nil {
+		return nil, fmt.Errorf("figram: reply is not JSON: %w", err)
+	}
+	r, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("figram: reply is not an object: %.200s", out)
+	}
+	variant, err := checkReply(r, id, op)
+	if err != nil {
+		return nil, fmt.Errorf("figram: protocol violation in the reply to %s: %w", op, err)
+	}
+	if variant == "error" {
+		return nil, &ProtocolError{Code: r["code"].(string), Message: r["error"].(string)}
+	}
+	delete(r, "id")
+	return r, nil
+}
+
+func decodeJSON(b []byte) (any, error) {
+	var v any
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if dec.More() {
+		return nil, errors.New("text after the JSON value")
+	}
+	return v, nil
+}
+
+func natOK(v any) bool {
+	n, ok := v.(json.Number)
+	if !ok {
+		return false
+	}
+	i, err := strconv.ParseInt(string(n), 10, 64)
+	return err == nil && i >= 0 && i <= MaxInt && string(n) == strconv.FormatInt(i, 10)
+}
+
+func nameOK(v any) bool { s, ok := v.(string); return ok && s != "" }
+
+func keysAre(m map[string]any, keys ...string) bool {
+	if len(m) != len(keys) {
+		return false
+	}
+	for _, k := range keys {
+		if _, ok := m[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func idIs(v any, id int64) bool {
+	return natOK(v) && v.(json.Number) == json.Number(strconv.FormatInt(id, 10))
+}
+
+// checkSnapshot checks a snapshot as schemas/snapshot.schema.json does.
+func checkSnapshot(v any) error {
+	s, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf("snapshot is not an object: %v", v)
+	}
+	for k := range s {
+		switch k {
+		case "v", "at", "resume", "timers", "seq":
+		default:
+			return fmt.Errorf("snapshot: unknown field %q", k)
+		}
+	}
+	if v, ok := s["v"]; ok && (!natOK(v) || v.(json.Number) != "1") {
+		return fmt.Errorf("snapshot: version %v", v)
+	}
+	if !nameOK(s["at"]) {
+		return fmt.Errorf("snapshot.at: %v", s["at"])
+	}
+	if r, ok := s["resume"]; ok {
+		m, ok := r.(map[string]any)
+		if !ok {
+			return fmt.Errorf("snapshot.resume is not an object")
+		}
+		for k, v := range m {
+			if k == "" || !nameOK(v) {
+				return fmt.Errorf("snapshot.resume.%q: %v", k, v)
+			}
+		}
+	}
+	if t, ok := s["timers"]; ok {
+		m, ok := t.(map[string]any)
+		if !ok {
+			return fmt.Errorf("snapshot.timers is not an object")
+		}
+		for k, v := range m {
+			if k == "" || !natOK(v) {
+				return fmt.Errorf("snapshot.timers.%q: %v", k, v)
+			}
+		}
+	}
+	if q, ok := s["seq"]; ok && !natOK(q) {
+		return fmt.Errorf("snapshot.seq: %v", q)
+	}
+	return nil
+}
+
+func checkAction(a any) error {
+	m, ok := a.(map[string]any)
+	if !ok {
+		return fmt.Errorf("action is not an object: %v", a)
+	}
+	switch {
+	case keysAre(m, "send"), keysAre(m, "call"), keysAre(m, "cancel_timer"):
+		for _, x := range m {
+			if !nameOK(x) {
+				return fmt.Errorf("action: %v", m)
+			}
+		}
+	case keysAre(m, "start_timer", "ms", "token"):
+		if !nameOK(m["start_timer"]) || !natOK(m["ms"]) || !natOK(m["token"]) {
+			return fmt.Errorf("start_timer: %v", m)
+		}
+	default:
+		return fmt.Errorf("unknown action form: %v", m)
+	}
+	return nil
+}
+
+func checkActions(v any) error {
+	acts, ok := v.([]any)
+	if !ok {
+		return fmt.Errorf("actions is not a list: %v", v)
+	}
+	for _, a := range acts {
+		if err := checkAction(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkReply accepts exactly one reply variant to op: "result", "need", "hello" or "error".
+func checkReply(r map[string]any, id int64, op string) (string, error) {
+	rest := map[string]any{}
+	for k, v := range r {
+		if k != "id" {
+			rest[k] = v
+		}
+	}
+	if _, isErr := rest["error"]; isErr {
+		if !keysAre(rest, "error", "code") {
+			return "", fmt.Errorf("error reply: fields %v (expected id, error, code)", rest)
+		}
+		if _, ok := rest["error"].(string); !ok {
+			return "", fmt.Errorf("error is not a string")
+		}
+		code, ok := rest["code"].(string)
+		if !ok || !errorCodes[code] {
+			return "", fmt.Errorf("unknown error code: %v", rest["code"])
+		}
+		// id null only for failures detected before the request was read (the library detects
+		// parse_error and too_large itself); otherwise the id must be the request's.
+		if idv, has := r["id"]; has && idv == nil && (code == CodeParseError || code == CodeTooLarge) {
+			return "error", nil
+		}
+		if !idIs(r["id"], id) {
+			return "", fmt.Errorf("reply id %v instead of %d", r["id"], id)
+		}
+		return "error", nil
+	}
+	if !idIs(r["id"], id) {
+		return "", fmt.Errorf("reply id %v instead of %d", r["id"], id)
+	}
+	if op == "hello" {
+		if !keysAre(rest, "protocol", "states") || !natOK(rest["protocol"]) || !natOK(rest["states"]) {
+			return "", fmt.Errorf("hello: %v", rest)
+		}
+		return "hello", nil
+	}
+	if op == "step" && keysAre(rest, "need") {
+		need, ok := rest["need"].([]any)
+		if !ok || len(need) == 0 {
+			return "", fmt.Errorf("need: %v", rest["need"])
+		}
+		for _, n := range need {
+			if !nameOK(n) {
+				return "", fmt.Errorf("need: %v", n)
+			}
+		}
+		return "need", nil
+	}
+	if !keysAre(rest, "snapshot", "actions") && !keysAre(rest, "snapshot", "actions", "recovered") {
+		return "", fmt.Errorf("reply to %s: fields %v", op, rest)
+	}
+	if rec, ok := rest["recovered"]; ok && (rec != true || op != "step") {
+		return "", fmt.Errorf("recovered: %v", rec)
+	}
+	if err := checkSnapshot(rest["snapshot"]); err != nil {
+		return "", err
+	}
+	if err := checkActions(rest["actions"]); err != nil {
+		return "", err
+	}
+	return "result", nil
+}
+
+// The conversions below take values already accepted by checkReply.
+
+func toInt(v any) int { i, _ := strconv.ParseInt(string(v.(json.Number)), 10, 64); return int(i) }
+
+func toUint(v any) uint64 { i, _ := strconv.ParseUint(string(v.(json.Number)), 10, 64); return i }
+
+func toSnapshot(m map[string]any) Snapshot {
+	s := Snapshot{At: m["at"].(string)}
+	if v, ok := m["v"]; ok {
+		s.V = toInt(v)
+	}
+	if r, ok := m["resume"].(map[string]any); ok {
+		s.Resume = make(map[string]string, len(r))
+		for k, v := range r {
+			s.Resume[k] = v.(string)
+		}
+	}
+	if t, ok := m["timers"].(map[string]any); ok {
+		s.Timers = make(map[string]uint64, len(t))
+		for k, v := range t {
+			s.Timers[k] = toUint(v)
+		}
+	}
+	if q, ok := m["seq"]; ok {
+		s.Seq = toUint(q)
+	}
+	return s
+}
+
+func toAction(m map[string]any) Action {
+	if name, ok := m["start_timer"]; ok {
+		return Action{Kind: StartTimer, Name: name.(string), Ms: toUint(m["ms"]), Token: toUint(m["token"])}
+	}
+	for k, v := range m {
+		return Action{Kind: ActionKind(k), Name: v.(string)}
+	}
+	return Action{}
+}
