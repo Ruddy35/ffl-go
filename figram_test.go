@@ -37,8 +37,10 @@ type scenario struct {
 	Doc   string `json:"doc"`
 	Name  string `json:"name"`
 	Start *struct {
-		Snapshot Snapshot `json:"snapshot"`
-		Actions  []Action `json:"actions"`
+		Event    *string         `json:"event"` // the request is start with this first event
+		Guards   map[string]bool `json:"guards"`
+		Snapshot Snapshot        `json:"snapshot"`
+		Actions  []Action        `json:"actions"`
 	} `json:"start"`
 	From  *Snapshot `json:"from"`
 	Steps []struct {
@@ -83,6 +85,9 @@ func run(b *Bot, s scenario) string {
 	var snap Snapshot
 	if s.Start != nil {
 		r, err := b.Start(0)
+		if s.Start.Event != nil {
+			r, err = b.StartWith(0, *s.Start.Event, s.Start.Guards)
+		}
 		if err != nil {
 			return "start: " + err.Error()
 		}
@@ -160,7 +165,7 @@ func TestGoldenConcurrent(t *testing.T) {
 
 func TestHello(t *testing.T) {
 	h, err := load(t, "pizza.bot.json").Hello()
-	if err != nil || h != (Hello{Protocol: 1, States: 11}) {
+	if err != nil || h != (Hello{Protocol: ProtocolVersion, States: 11}) || ProtocolVersion != 2 {
 		t.Fatalf("Hello = %+v, %v", h, err)
 	}
 }
@@ -216,6 +221,65 @@ func TestStartSeqAndRestart(t *testing.T) {
 	}
 }
 
+// The first event of a new user (docs/format.md, section 7, decision 9).
+func TestStartWith(t *testing.T) {
+	b := load(t, "features.bot.json")
+	// The variant of the initial message depends on a condition: need, then Decide.
+	r, err := b.StartWith(0, "btn:go", nil)
+	if err != nil || !reflect.DeepEqual(r.Need, []string{"is_vip"}) || r.Snapshot.At != "" {
+		t.Fatalf("StartWith without guards = %s, %v", dump(r), err)
+	}
+	r, err = Decide(nil, func(string) (bool, error) { return true, nil },
+		func(g map[string]bool) (*Result, error) { return b.StartWith(0, "btn:go", g) })
+	want := &Result{Snapshot: Snapshot{At: "vip", Seq: 1}, Actions: []Action{{Kind: Send, Name: "vip"}}}
+	if err != nil || !reflect.DeepEqual(r, want) {
+		t.Fatalf("Decide(StartWith) = %s, %v", dump(r), err)
+	}
+	// Without a variant: the plain start, with the high-water mark.
+	r, err = b.StartWith(41, "btn:nothing", nil)
+	plain, err2 := b.Start(41)
+	if err != nil || err2 != nil || !reflect.DeepEqual(r, plain) || r.Snapshot.Seq != 42 {
+		t.Fatalf("StartWith(41, unmatched) = %s, %v; Start(41) = %s, %v", dump(r), err, dump(plain), err2)
+	}
+	// A timer event and an empty event are rejected.
+	if _, err := b.StartWith(0, "timer:idle", nil); !isCode(err, CodeBadRequest) {
+		t.Fatalf("StartWith(timer event): %v", err)
+	}
+	if _, err := b.StartWith(0, "", nil); !isCode(err, CodeBadRequest) {
+		t.Fatalf("StartWith(empty event): %v", err)
+	}
+}
+
+// A step from a removed message processes its event (decision 8): the old timers are cancelled,
+// the places kept, and the step may ask for conditions.
+func TestRecoveredStep(t *testing.T) {
+	b := load(t, "features.bot.json")
+	gone := Snapshot{At: "gone", Back: "home", Timers: map[string]uint64{"old": 3}, Seq: 7}
+	r, err := b.Step(gone, "btn:go", nil)
+	if err != nil || !reflect.DeepEqual(r.Need, []string{"is_vip"}) {
+		t.Fatalf("recovered step without guards = %s, %v", dump(r), err)
+	}
+	r, err = b.Step(gone, "btn:go", map[string]bool{"is_vip": false})
+	want := &Result{
+		Snapshot:  Snapshot{At: "catalog", Back: "home", Resume: map[string]string{"shop": "catalog"}, Seq: 8},
+		Actions:   []Action{{Kind: CancelTimer, Name: "old"}, {Kind: Send, Name: "catalog"}},
+		Recovered: true,
+	}
+	if err != nil || !reflect.DeepEqual(r, want) {
+		t.Fatalf("recovered step = %s, %v", dump(r), err)
+	}
+}
+
+// Load rejects a library of another protocol version.
+func TestProtocolMismatch(t *testing.T) {
+	if err := protocolMismatch(ProtocolVersion); err != nil {
+		t.Fatalf("protocolMismatch(%d) = %v", ProtocolVersion, err)
+	}
+	if err := protocolMismatch(1); err == nil || !strings.Contains(err.Error(), "protocol 1") {
+		t.Fatalf("protocolMismatch(1) = %v", err)
+	}
+}
+
 func isCode(err error, code string) bool {
 	var pe *ProtocolError
 	return errors.As(err, &pe) && pe.Code == code
@@ -260,7 +324,7 @@ func second(_ *Result, err error) error { return err }
 func TestRawRequest(t *testing.T) {
 	b := load(t, "pizza.bot.json")
 	cases := map[string]string{
-		`{"id":1,"op":"hello"}`: `{"id":1,"protocol":1,"states":11}`,
+		`{"id":1,"op":"hello"}`: `{"id":1,"protocol":2,"states":11}`,
 		`{"id":8,"op":"step","snapshot":{"at":"cart"},"event":"btn:checkout","gaurds":{}}`: `{"id":8,"error":"unknown request field ` +
 			"`gaurds`" + `","code":"bad_request"}`,
 		``:    `"code":"parse_error"`,
@@ -360,10 +424,15 @@ func TestActionJSON(t *testing.T) {
 }
 
 func TestSnapshotJSON(t *testing.T) {
-	s := Snapshot{At: "a", Resume: map[string]string{"s": "a"}, Timers: map[string]uint64{"t": 0}, Seq: 5}
+	s := Snapshot{At: "a", Back: "b", Resume: map[string]string{"s": "a"}, Timers: map[string]uint64{"t": 0}, Seq: 5}
 	b, _ := json.Marshal(s)
-	if string(b) != `{"at":"a","resume":{"s":"a"},"timers":{"t":0},"seq":5}` {
+	// The field order of the engine.
+	if string(b) != `{"at":"a","back":"b","resume":{"s":"a"},"timers":{"t":0},"seq":5}` {
 		t.Fatalf("Marshal = %s", b)
+	}
+	var back Snapshot
+	if err := json.Unmarshal(b, &back); err != nil || !reflect.DeepEqual(back, s) {
+		t.Fatalf("Unmarshal = %+v, %v", back, err)
 	}
 	b, _ = json.Marshal(Snapshot{At: "a"})
 	if string(b) != `{"at":"a"}` {
@@ -407,8 +476,8 @@ func TestCheckReply(t *testing.T) {
 		{"step", `{"id":null,"error":"x","code":"bad_request"}`, "ERR"},
 		{"step", `{"id":6,"error":"x","code":"bad_request"}`, "ERR"},
 		{"step", `{"id":5,"error":"x"}`, "ERR"},
-		{"hello", `{"id":5,"protocol":1,"states":11}`, "hello"},
-		{"hello", `{"id":5,"protocol":1,"states":11,"mutant":"x"}`, "ERR"},
+		{"hello", `{"id":5,"protocol":2,"states":11}`, "hello"},
+		{"hello", `{"id":5,"protocol":2,"states":11,"mutant":"x"}`, "ERR"},
 		{"hello", `{"id":5,"protocol":1.5,"states":11}`, "ERR"},
 		{"start", `{"id":5,"snapshot":{"at":"menu","seq":8},"actions":[{"send":"menu"}]}`, "result"},
 		{"start", `{"id":"5","snapshot":{"at":"menu","seq":8},"actions":[]}`, "ERR"},
@@ -421,7 +490,17 @@ func TestCheckReply(t *testing.T) {
 		{"step", `{"id":5,"snapshot":{"at":"menu"}}`, "ERR"},
 		{"step", `{"id":5,"need":["c"]}`, "need"},
 		{"step", `{"id":5,"need":[]}`, "ERR"},
-		{"start", `{"id":5,"need":["c"]}`, "ERR"},
+		// Protocol 2: start with an event may answer need; restart and hello never do.
+		{"start", `{"id":5,"need":["c"]}`, "need"},
+		{"start", `{"id":5,"need":[]}`, "ERR"},
+		{"restart", `{"id":5,"need":["c"]}`, "ERR"},
+		{"hello", `{"id":5,"need":["c"]}`, "ERR"},
+		{"restart", `{"id":5,"snapshot":{"at":"menu"},"actions":[],"recovered":true}`, "ERR"},
+		// The snapshot field back: a message name.
+		{"step", `{"id":5,"snapshot":{"at":"vip","back":"home","seq":1},"actions":[]}`, "result"},
+		{"step", `{"id":5,"snapshot":{"at":"vip","back":"","seq":1},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"vip","back":1,"seq":1},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"vip","back":null,"seq":1},"actions":[]}`, "ERR"},
 	}
 	for _, c := range cases {
 		v, err := decodeJSON([]byte(c.reply))

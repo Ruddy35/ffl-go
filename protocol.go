@@ -10,12 +10,16 @@ import (
 	"strings"
 )
 
-// The typed engine protocol, version 1 (docs/format.md, section 8, in the Figram repository).
+// The typed engine protocol, version 2 (docs/format.md, section 8, in the Figram repository).
 // Every reply is checked strictly: the id echo, exactly one reply variant, the field types and
 // value ranges; a reply that breaks the protocol is an error, never a partial result.
 
 // MaxInt is the largest integer of the protocol (2^53 − 1): tokens, delays and seq.
 const MaxInt = 1<<53 - 1
+
+// ProtocolVersion is the version of the engine protocol this package speaks; [Load] rejects a
+// library that speaks another one (possible with the build tag figram_system).
+const ProtocolVersion = 2
 
 // Snapshot is the state of one user, kept by the host between events (in a database, for
 // example) and passed back with the next request. Store it as its JSON encoding; the engine
@@ -23,6 +27,7 @@ const MaxInt = 1<<53 - 1
 type Snapshot struct {
 	V      int               `json:"v,omitempty"`      // version; 0 means 1
 	At     string            `json:"at"`               // the current message
+	Back   string            `json:"back,omitempty"`   // the message "back" leads to (left at the last section crossing)
 	Resume map[string]string `json:"resume,omitempty"` // section → message: the places "resume" leads to
 	Timers map[string]uint64 `json:"timers,omitempty"` // timer → token: the active timers
 	Seq    uint64            `json:"seq,omitempty"`    // the number of the last transition
@@ -75,18 +80,20 @@ func (a *Action) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// Result is the reply to [Bot.Start], [Bot.Restart], [Bot.Step] and [Bot.Timer].
+// Result is the reply to [Bot.Start], [Bot.StartWith], [Bot.Restart], [Bot.Step] and [Bot.Timer].
 type Result struct {
-	// Need is set only by a step whose choice depends on conditions that were not given: repeat
-	// the same step with their values added to the guards (see [Decide]). Snapshot and Actions
-	// are empty then.
+	// Need is set only by a step or a start with an event whose choice depends on conditions
+	// that were not given: repeat the same call with their values added to the guards (see
+	// [Decide]). Snapshot and Actions are empty then.
 	Need []string
 	// Snapshot is the new state of the user: store it, then execute Actions.
 	Snapshot Snapshot
 	// Actions are executed by the host in this order.
 	Actions []Action
-	// Recovered: the snapshot's message is not in the document (it was edited), so the user was
-	// started over; the event of the request was not processed.
+	// Recovered: the snapshot's message is not in the document (it was edited). The old timers
+	// were cancelled, the remembered places kept, and the event was processed as [Bot.StartWith]
+	// processes it (a timer event starts the user over). Do not deliver the event again: it has
+	// been processed.
 	Recovered bool
 }
 
@@ -108,7 +115,7 @@ func (r Result) MarshalJSON() ([]byte, error) {
 
 // Hello is the reply to [Bot.Hello].
 type Hello struct {
-	Protocol int // the protocol version: 1
+	Protocol int // the protocol version: [ProtocolVersion]
 	States   int // the number of messages of the document
 }
 
@@ -146,13 +153,33 @@ func (b *Bot) Hello() (Hello, error) {
 // Start enters the bot for a new user. seq is the user's high-water mark: the largest seq ever
 // issued to this user, or 0 for a user who never had a snapshot. Starting an existing user over
 // from 0 gives new actions the idempotency keys of old ones (docs/host-contract.md); use
-// [Bot.Restart] with the user's snapshot instead.
+// [Bot.Restart] with the user's snapshot instead. A user who comes with an update (a command, a
+// button of an old message) is started with [Bot.StartWith] and its event.
 func (b *Bot) Start(seq uint64) (*Result, error) {
+	return b.result("start", startFields(seq))
+}
+
+// StartWith enters the bot for a new user with the user's first event, for example "cmd:start"
+// or the button of an old message. The event is matched as if the user stood on the initial
+// message, which is neither entered nor left: a matching variant gives its actions and the entry
+// into its target in one result; without one the result is that of [Bot.Start]. guards and Need
+// work as for [Bot.Step] (see [Decide]); seq is the high-water mark as for [Bot.Start]. A timer
+// event is rejected with [CodeBadRequest].
+func (b *Bot) StartWith(seq uint64, event string, guards map[string]bool) (*Result, error) {
+	f := startFields(seq)
+	f["event"] = event
+	if len(guards) > 0 {
+		f["guards"] = guards
+	}
+	return b.result("start", f)
+}
+
+func startFields(seq uint64) map[string]any {
 	f := map[string]any{}
 	if seq != 0 {
 		f["seq"] = seq
 	}
-	return b.result("start", f)
+	return f
 }
 
 // Restart starts the user over: it cancels the snapshot's timers, clears the remembered places
@@ -319,7 +346,7 @@ func checkSnapshot(v any) error {
 	}
 	for k := range s {
 		switch k {
-		case "v", "at", "resume", "timers", "seq":
+		case "v", "at", "back", "resume", "timers", "seq":
 		default:
 			return fmt.Errorf("snapshot: unknown field %q", k)
 		}
@@ -329,6 +356,9 @@ func checkSnapshot(v any) error {
 	}
 	if !nameOK(s["at"]) {
 		return fmt.Errorf("snapshot.at: %v", s["at"])
+	}
+	if v, ok := s["back"]; ok && !nameOK(v) {
+		return fmt.Errorf("snapshot.back: %v", v)
 	}
 	if r, ok := s["resume"]; ok {
 		m, ok := r.(map[string]any)
@@ -431,7 +461,7 @@ func checkReply(r map[string]any, id int64, op string) (string, error) {
 		}
 		return "hello", nil
 	}
-	if op == "step" && keysAre(rest, "need") {
+	if (op == "step" || op == "start") && keysAre(rest, "need") {
 		need, ok := rest["need"].([]any)
 		if !ok || len(need) == 0 {
 			return "", fmt.Errorf("need: %v", rest["need"])
@@ -468,6 +498,9 @@ func toSnapshot(m map[string]any) Snapshot {
 	s := Snapshot{At: m["at"].(string)}
 	if v, ok := m["v"]; ok {
 		s.V = toInt(v)
+	}
+	if v, ok := m["back"]; ok {
+		s.Back = v.(string)
 	}
 	if r, ok := m["resume"].(map[string]any); ok {
 		s.Resume = make(map[string]string, len(r))

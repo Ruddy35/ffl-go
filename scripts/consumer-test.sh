@@ -52,7 +52,7 @@ func main() {
 	fmt.Println(string(b))
 }
 GO
-want='{"actions":[{"send":"catalog"}],"snapshot":{"at":"catalog","resume":{"order":"catalog"},"seq":2}}'
+want='{"actions":[{"send":"catalog"}],"snapshot":{"at":"catalog","back":"menu","resume":{"order":"catalog"},"seq":2}}'
 check() { # binary
   got=$("./$1" "$root/testdata/pizza.bot.json")
   [ "$got" = "$want" ] || { echo "$1: unexpected output: $got"; exit 1; }

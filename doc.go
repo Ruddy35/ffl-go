@@ -10,6 +10,9 @@
 //	res, err := bot.Start(0)                            // a new user
 //	res, err = bot.Step(res.Snapshot, "btn:order", nil) // an event of that user
 //
+// A new user who comes with an update (a command, a button of an old message) is started with
+// [Bot.StartWith] and the update's event, which the start processes.
+//
 // Store res.Snapshot (its JSON encoding), then execute res.Actions in order: send messages, run
 // the host's actions, start and cancel timers. When a timer fires, call [Bot.Timer] with the name
 // and token of its start_timer action. When the choice of a step depends on conditions the host
@@ -33,6 +36,6 @@
 // another platform). Only static linking into an executable is supported: -buildmode=c-shared
 // and plugins cannot be built.
 //
-// [format]: https://github.com/Ruddy35/figram-fsm-library/blob/v0.1.0/docs/format.md
-// [host contract]: https://github.com/Ruddy35/figram-fsm-library/blob/v0.1.0/docs/host-contract.md
+// [format]: https://github.com/Ruddy35/figram-fsm-library/blob/v0.2.0/docs/format.md
+// [host contract]: https://github.com/Ruddy35/figram-fsm-library/blob/v0.2.0/docs/host-contract.md
 package figram
