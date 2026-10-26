@@ -175,10 +175,10 @@ The module version follows the Figram release whose libraries it bundles
 (`figram.BundledVersion`): ffl-go v0.2.0 bundles Figram v0.2.0 and speaks protocol version 2
 (`figram.ProtocolVersion`); `Load` rejects a library of another protocol version, which the
 build tag `figram_system` could link. ffl-go v0.1.0 speaks protocol 1 and works only with
-Figram v0.1.0. `scripts/update-lib.sh VERSION`
-replaces the libraries, the header and the test data with those of another release, verified
-with the release's `SHA256SUMS`; `scripts/update-lib.sh --check` (run by CI) checks that the tree
-equals the release byte for byte.
+Figram v0.1.0. `scripts/update-lib.sh VERSION` replaces the libraries, the header and the test
+data with those of another release, verified with the release's `SHA256SUMS`;
+`scripts/update-lib.sh --check` (run by CI) checks that the tree equals the release byte for
+byte.
 
 ## Development
 
@@ -189,6 +189,21 @@ scripts/consumer-test.sh       # a separate module: plain, vendored and --gc-sec
 python3 scripts/mutants.py     # deliberate defects of the wrapper must fail the tests
 scripts/update-lib.sh --check  # the bundled files equal the release
 ```
+
+## Releasing
+
+1. `scripts/update-lib.sh X.Y.Z` with the Figram release, add the section `## [X.Y.Z] - DATE` to
+   `CHANGELOG.md`, merge to `master` and wait for `ci`.
+2. **Actions → release → Run workflow** on `master` with the version `X.Y.Z`. The workflow
+   checks that `BundledVersion`, `lib/linux_amd64/VERSION` and the CHANGELOG section match the
+   version and that an existing tag `vX.Y.Z` points at the commit, runs the checks of
+   [Development](#development), and creates (or updates) the draft release `vX.Y.Z` with the
+   CHANGELOG section, the install line and a provenance block (commit, the release's
+   `SHA256SUMS`, the workflow run). Only its last job, which runs no code of the repository, can
+   write to the repository.
+3. Review the draft and publish it: publishing creates the tag `vX.Y.Z`, which is the module
+   version. A published version is final (the Go module proxy keeps it); fix problems with a new
+   version. The workflow never publishes a release and refuses to change a published one.
 
 ## License
 
