@@ -19,6 +19,12 @@ muts = [
  ("check ok ignored", "figram.go", '\tif out == "ok" {\n\t\treturn nil\n\t}', '\tif true {\n\t\treturn nil\n\t}'),
  ("SIGPIPE ignored after init", "figram.go", "\tinitOnce.Do(func() {", "\tdefer signal.Ignore(syscall.SIGPIPE)\n\tinitOnce.Do(func() {"),
  ("close does not stop requests", "figram.go", "\tif b.m == nil {\n\t\treturn nil, ErrClosed\n\t}", "\tif b.m == nil {\n\t\treturn []byte(`{}`), nil\n\t}"),
+ ("start with an event sends no event", "protocol.go", '\tf["event"] = event\n\tif len(guards) > 0 {\n\t\tf["guards"] = guards\n\t}\n\treturn b.result("start", f)', '\t_ = event\n\tif len(guards) > 0 {\n\t\tf["guards"] = guards\n\t}\n\treturn b.result("start", f)'),
+ ("start with an event drops the guards", "protocol.go", '\tf["event"] = event\n\tif len(guards) > 0 {\n\t\tf["guards"] = guards\n\t}', '\tf["event"] = event\n\t_ = guards'),
+ ("need of start rejected", "protocol.go", '(op == "step" || op == "start") && keysAre(rest, "need")', 'op == "step" && keysAre(rest, "need")'),
+ ("snapshot loses back", "protocol.go", '\tif v, ok := m["back"]; ok {\n\t\ts.Back = v.(string)\n\t}', ''),
+ ("empty back accepted", "protocol.go", 'if v, ok := s["back"]; ok && !nameOK(v) {', 'if v, ok := s["back"]; ok && false && !nameOK(v) {'),
+ ("protocol version not checked", "figram.go", "\tif p != ProtocolVersion {", "\tif false {"),
 ]
 bad = 0
 for name, f, old, new in muts:

@@ -161,7 +161,8 @@ type Bot struct {
 	nextID atomic.Int64
 }
 
-// Load checks and compiles a document. A rejected document gives a [*DocumentError].
+// Load checks and compiles a document. A rejected document gives a [*DocumentError]. Load also
+// fails if the library speaks another protocol version than [ProtocolVersion].
 func Load(doc string) (*Bot, error) {
 	if err := checkDoc(doc); err != nil {
 		return nil, err
@@ -179,7 +180,29 @@ func Load(doc string) (*Bot, error) {
 	}
 	b := &Bot{m: m}
 	runtime.SetFinalizer(b, (*Bot).Close)
+	if err := b.checkProtocol(); err != nil {
+		b.Close()
+		return nil, err
+	}
 	return b, nil
+}
+
+// checkProtocol rejects a library that speaks another protocol version than this package (with
+// the build tag figram_system the library may be of another release).
+func (b *Bot) checkProtocol() error {
+	h, err := b.Hello()
+	if err != nil {
+		return err
+	}
+	return protocolMismatch(h.Protocol)
+}
+
+func protocolMismatch(p int) error {
+	if p != ProtocolVersion {
+		return fmt.Errorf("figram: the library speaks protocol %d, this package needs %d (Figram %s)",
+			p, ProtocolVersion, BundledVersion)
+	}
+	return nil
 }
 
 // Close frees the machine after the running requests finish. Later requests fail with

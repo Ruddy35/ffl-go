@@ -41,8 +41,28 @@ func Example() {
 	}
 	// Output:
 	// menu [{"send":"menu"}]
-	// {"at":"catalog","resume":{"order":"catalog"},"seq":2}
+	// {"at":"catalog","back":"menu","resume":{"order":"catalog"},"seq":2}
 	// send catalog
+}
+
+// A new user comes with an update, here the button "Order" of an old message: the start
+// processes it as if the user stood on the initial message.
+func ExampleBot_StartWith() {
+	doc, _ := os.ReadFile("testdata/pizza.bot.json")
+	bot, err := figram.Load(string(doc))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer bot.Close()
+	res, err := bot.StartWith(0, "btn:order", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	stored, _ := json.Marshal(res.Snapshot)
+	actions, _ := json.Marshal(res.Actions)
+	fmt.Println(string(stored), string(actions))
+	// Output:
+	// {"at":"catalog","resume":{"order":"catalog"},"seq":1} [{"send":"catalog"}]
 }
 
 // The engine asks for the conditions it needs; Decide evaluates them and repeats the step.
