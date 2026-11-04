@@ -25,6 +25,13 @@ muts = [
  ("snapshot loses back", "protocol.go", '\tif v, ok := m["back"]; ok {\n\t\ts.Back = v.(string)\n\t}', ''),
  ("empty back accepted", "protocol.go", 'if v, ok := s["back"]; ok && !nameOK(v) {', 'if v, ok := s["back"]; ok && false && !nameOK(v) {'),
  ("protocol version not checked", "figram.go", "\tif p != ProtocolVersion {", "\tif false {"),
+ ("outcome token not sent", "protocol.go", '"event": "call:" + action + ":" + outcome, "token": token}', '"event": "call:" + action + ":" + outcome, "token": 1}'),
+ ("snapshot loses pending", "protocol.go", "\t\t\ts.Pending = append(s.Pending, Wait{Call: wm[\"call\"].(string), Token: toUint(wm[\"token\"])})", "\t\t\t_ = wm"),
+ ("call loses its token", "protocol.go", "\t\t\ta.Outcomes, a.Token = true, toUint(t)", "\t\t\ta.Outcomes = t != nil"),
+ ("call loses detached", "protocol.go", 'Detached: m["detached"] == true}', 'Detached: false}'),
+ ("pending not checked", "protocol.go", '\t\t\tif !ok || !keysAre(m, "call", "token") || !nameOK(m["call"]) || !natOK(m["token"]) {', '\t\t\tif !ok || m == nil {'),
+ ("detached false accepted", "protocol.go", '\t\tif d, ok := m["detached"]; ok && d != true {', '\t\tif d, ok := m["detached"]; ok && d == nil {'),
+ ("snapshot_too_large unknown", "protocol.go", "\tCodeSnapshotTooLarge: true,\n", ""),
 ]
 bad = 0
 for name, f, old, new in muts:

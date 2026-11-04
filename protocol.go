@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// The typed engine protocol, version 2 (docs/format.md, section 8, in the Figram repository).
+// The typed engine protocol, version 3 (docs/format.md, section 8, in the Figram repository).
 // Every reply is checked strictly: the id echo, exactly one reply variant, the field types and
 // value ranges; a reply that breaks the protocol is an error, never a partial result.
 
@@ -19,18 +19,26 @@ const MaxInt = 1<<53 - 1
 
 // ProtocolVersion is the version of the engine protocol this package speaks; [Load] rejects a
 // library that speaks another one (possible with the build tag figram_system).
-const ProtocolVersion = 2
+const ProtocolVersion = 3
 
 // Snapshot is the state of one user, kept by the host between events (in a database, for
 // example) and passed back with the next request. Store it as its JSON encoding; the engine
 // rejects unknown fields.
 type Snapshot struct {
-	V      int               `json:"v,omitempty"`      // version; 0 means 1
-	At     string            `json:"at"`               // the current message
-	Back   string            `json:"back,omitempty"`   // the message "back" leads to (left at the last section crossing)
-	Resume map[string]string `json:"resume,omitempty"` // section → message: the places "resume" leads to
-	Timers map[string]uint64 `json:"timers,omitempty"` // timer → token: the active timers
-	Seq    uint64            `json:"seq,omitempty"`    // the number of the last transition
+	V       int               `json:"v,omitempty"`       // version; 0 means 1
+	At      string            `json:"at"`                // the current message
+	Back    string            `json:"back,omitempty"`    // the message "back" leads to (left at the last section crossing)
+	Resume  map[string]string `json:"resume,omitempty"`  // section → message: the places "resume" leads to
+	Timers  map[string]uint64 `json:"timers,omitempty"`  // timer → token: the active timers
+	Pending []Wait            `json:"pending,omitempty"` // the calls whose outcome is awaited, newest first
+	Seq     uint64            `json:"seq,omitempty"`     // the number of the last transition
+}
+
+// Wait is a call of an action with outcomes whose outcome has not come yet: [Bot.Outcome] with
+// this action and token is accepted once.
+type Wait struct {
+	Call  string `json:"call"`  // the action
+	Token uint64 `json:"token"` // the token of the call
 }
 
 // ActionKind is the kind of an [Action].
@@ -39,7 +47,7 @@ type ActionKind string
 // The actions the host executes, in the order of [Result.Actions].
 const (
 	Send        ActionKind = "send"         // send the message Name to the user
-	Call        ActionKind = "call"         // run the action Name of the host
+	Call        ActionKind = "call"         // run the action Name of the host (see Outcomes, Detached)
 	StartTimer  ActionKind = "start_timer"  // start the timer Name for Ms milliseconds with Token
 	CancelTimer ActionKind = "cancel_timer" // cancel the timer Name
 )
@@ -49,14 +57,31 @@ type Action struct {
 	Kind  ActionKind
 	Name  string // the message (Send), the action (Call) or the timer (StartTimer, CancelTimer)
 	Ms    uint64 // StartTimer: the delay in milliseconds
-	Token uint64 // StartTimer: the token to pass to [Bot.Timer] when the timer fires
+	Token uint64 // StartTimer: the token to pass to [Bot.Timer]; Call with Outcomes: to [Bot.Outcome]
+	// Outcomes (Call): the action reports how it ended. After performing it, deliver exactly one
+	// outcome with [Bot.Outcome] and Token: a declared outcome, or "failed" when the host gives
+	// up without an answer (reconcile first: docs/host-contract.md, section 2).
+	Outcomes bool
+	// Detached (Call): a background action. Run it later and in any order; the user's next event
+	// does not wait for it.
+	Detached bool
 }
 
 // MarshalJSON writes the protocol form, e.g. {"start_timer":"t","ms":5000,"token":3}.
 func (a Action) MarshalJSON() ([]byte, error) {
 	switch a.Kind {
-	case Send, Call, CancelTimer:
+	case Send, CancelTimer:
 		return json.Marshal(map[string]string{string(a.Kind): a.Name})
+	case Call:
+		c := struct {
+			Name     string  `json:"call"`
+			Token    *uint64 `json:"token,omitempty"`
+			Detached bool    `json:"detached,omitempty"`
+		}{Name: a.Name, Detached: a.Detached}
+		if a.Outcomes {
+			c.Token = &a.Token
+		}
+		return json.Marshal(c)
 	case StartTimer:
 		return json.Marshal(struct {
 			Name  string `json:"start_timer"`
@@ -126,10 +151,14 @@ const (
 	CodeBadRequest  = "bad_request"  // a wrong field: an empty event, a token without a timer event, ...
 	CodeBadSnapshot = "bad_snapshot" // the snapshot is not accepted
 	CodeSeqOverflow = "seq_overflow" // the new seq would exceed MaxInt
+	// CodeSnapshotTooLarge: the new snapshot would take more than 15/16 of the request size limit
+	// ([SetMaxRequest]); the stored snapshot still works for the outcomes and [Bot.Restart].
+	CodeSnapshotTooLarge = "snapshot_too_large"
 )
 
 var errorCodes = map[string]bool{
 	CodeParseError: true, CodeTooLarge: true, CodeBadRequest: true, CodeBadSnapshot: true, CodeSeqOverflow: true,
+	CodeSnapshotTooLarge: true,
 }
 
 // ProtocolError is an error reply of the engine. The snapshot of the request is unchanged, and
@@ -204,6 +233,23 @@ func (b *Bot) Step(s Snapshot, event string, guards map[string]bool) (*Result, e
 // nothing (the result has the same snapshot and no actions).
 func (b *Bot) Timer(s Snapshot, timer string, token uint64, guards map[string]bool) (*Result, error) {
 	f := map[string]any{"snapshot": s, "event": "timer:" + timer, "token": token}
+	if len(guards) > 0 {
+		f["guards"] = guards
+	}
+	return b.result("step", f)
+}
+
+// Outcome processes the outcome of a call of an action with outcomes ([Action.Outcomes]): action
+// is its Name, outcome a declared outcome of it or "failed", token its Token. The engine accepts
+// it once, only while the snapshot waits for that call ([Snapshot.Pending]), and then handles it
+// like any event, by the arrows of the message the user is on; a stale or repeated outcome
+// changes nothing. guards and Need work as for [Bot.Step].
+func (b *Bot) Outcome(s Snapshot, action, outcome string, token uint64, guards map[string]bool) (*Result, error) {
+	if action == "" || outcome == "" || strings.Contains(outcome, ":") {
+		return nil, fmt.Errorf("figram: outcome event: action %q, outcome %q (both non-empty, no ':' in the outcome)",
+			action, outcome)
+	}
+	f := map[string]any{"snapshot": s, "event": "call:" + action + ":" + outcome, "token": token}
 	if len(guards) > 0 {
 		f["guards"] = guards
 	}
@@ -346,7 +392,7 @@ func checkSnapshot(v any) error {
 	}
 	for k := range s {
 		switch k {
-		case "v", "at", "back", "resume", "timers", "seq":
+		case "v", "at", "back", "resume", "timers", "pending", "seq":
 		default:
 			return fmt.Errorf("snapshot: unknown field %q", k)
 		}
@@ -382,6 +428,18 @@ func checkSnapshot(v any) error {
 			}
 		}
 	}
+	if p, ok := s["pending"]; ok {
+		l, ok := p.([]any)
+		if !ok {
+			return fmt.Errorf("snapshot.pending is not a list")
+		}
+		for _, w := range l {
+			m, ok := w.(map[string]any)
+			if !ok || !keysAre(m, "call", "token") || !nameOK(m["call"]) || !natOK(m["token"]) {
+				return fmt.Errorf("snapshot.pending: %v", w)
+			}
+		}
+	}
 	if q, ok := s["seq"]; ok && !natOK(q) {
 		return fmt.Errorf("snapshot.seq: %v", q)
 	}
@@ -394,11 +452,23 @@ func checkAction(a any) error {
 		return fmt.Errorf("action is not an object: %v", a)
 	}
 	switch {
-	case keysAre(m, "send"), keysAre(m, "call"), keysAre(m, "cancel_timer"):
+	case keysAre(m, "send"), keysAre(m, "cancel_timer"):
 		for _, x := range m {
 			if !nameOK(x) {
 				return fmt.Errorf("action: %v", m)
 			}
+		}
+	case keysAre(m, "call"), keysAre(m, "call", "token"), keysAre(m, "call", "detached"),
+		keysAre(m, "call", "token", "detached"):
+		// token: an action with outcomes; detached: a background action, written only as true
+		if !nameOK(m["call"]) {
+			return fmt.Errorf("call: %v", m)
+		}
+		if t, ok := m["token"]; ok && !natOK(t) {
+			return fmt.Errorf("call.token: %v", m)
+		}
+		if d, ok := m["detached"]; ok && d != true {
+			return fmt.Errorf("call.detached: %v", m)
 		}
 	case keysAre(m, "start_timer", "ms", "token"):
 		if !nameOK(m["start_timer"]) || !natOK(m["ms"]) || !natOK(m["token"]) {
@@ -514,6 +584,13 @@ func toSnapshot(m map[string]any) Snapshot {
 			s.Timers[k] = toUint(v)
 		}
 	}
+	if p, ok := m["pending"].([]any); ok {
+		s.Pending = make([]Wait, 0, len(p))
+		for _, w := range p {
+			wm := w.(map[string]any)
+			s.Pending = append(s.Pending, Wait{Call: wm["call"].(string), Token: toUint(wm["token"])})
+		}
+	}
 	if q, ok := m["seq"]; ok {
 		s.Seq = toUint(q)
 	}
@@ -523,6 +600,13 @@ func toSnapshot(m map[string]any) Snapshot {
 func toAction(m map[string]any) Action {
 	if name, ok := m["start_timer"]; ok {
 		return Action{Kind: StartTimer, Name: name.(string), Ms: toUint(m["ms"]), Token: toUint(m["token"])}
+	}
+	if name, ok := m["call"]; ok {
+		a := Action{Kind: Call, Name: name.(string), Detached: m["detached"] == true}
+		if t, ok := m["token"]; ok {
+			a.Outcomes, a.Token = true, toUint(t)
+		}
+		return a
 	}
 	for k, v := range m {
 		return Action{Kind: ActionKind(k), Name: v.(string)}

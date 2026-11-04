@@ -15,7 +15,10 @@
 //
 // Store res.Snapshot (its JSON encoding), then execute res.Actions in order: send messages, run
 // the host's actions, start and cancel timers. When a timer fires, call [Bot.Timer] with the name
-// and token of its start_timer action. When the choice of a step depends on conditions the host
+// and token of its start_timer action. A call of an action with outcomes ([Action.Outcomes])
+// carries a token, and the snapshot waits for it ([Snapshot.Pending]): after performing the
+// action, pass exactly one outcome to [Bot.Outcome] with that token. A background action
+// ([Action.Detached]) may run later and in any order. When the choice of a step depends on conditions the host
 // did not pass, the result only lists them in [Result.Need]; [Decide] evaluates them and repeats
 // the step. The rules a host follows to keep snapshots, actions and timers consistent under
 // retries and crashes (idempotency keys, ordering) are in the [host contract].
@@ -36,6 +39,6 @@
 // another platform). Only static linking into an executable is supported: -buildmode=c-shared
 // and plugins cannot be built.
 //
-// [format]: https://github.com/Ruddy35/figram-fsm-library/blob/v0.2.0/docs/format.md
-// [host contract]: https://github.com/Ruddy35/figram-fsm-library/blob/v0.2.0/docs/host-contract.md
+// [format]: https://github.com/Ruddy35/figram-fsm-library/blob/v0.3.0/docs/format.md
+// [host contract]: https://github.com/Ruddy35/figram-fsm-library/blob/v0.3.0/docs/host-contract.md
 package figram

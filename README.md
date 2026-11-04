@@ -5,7 +5,8 @@
 
 Go bindings for [Figram](https://github.com/Ruddy35/figram-fsm-library), a finite-state-machine
 engine for chat bots. A bot is a JSON document: nested sections, buttons and other events, guarded
-arrows, actions, "resume where the user left off", "back to the previous section" and timers. The engine that executes it is
+arrows, actions (background actions, and actions that report how they ended), "resume where the
+user left off", "back to the previous section" and timers. The engine that executes it is
 written and proved in Lean 4 and is linked into your program as a static C library: no separate
 process, no network, no state of its own.
 
@@ -18,8 +19,8 @@ import figram "github.com/Ruddy35/ffl-go"
 * `Load` checks and compiles a document once; a `*Bot` serves all users from many goroutines.
 * Stateless and deterministic: the host keeps a small JSON `Snapshot` per user, and the same
   snapshot, event and guards always give the same result.
-* Typed protocol (version 2): `Start`, `StartWith` (a new user's first event), `Step`, `Timer`,
-  `Restart`, `Hello`; every reply of the engine is checked strictly, and errors carry the
+* Typed protocol (version 3): `Start`, `StartWith` (a new user's first event), `Step`, `Timer`,
+  `Outcome` (the outcome of an action), `Restart`, `Hello`; every reply of the engine is checked strictly, and errors carry the
   protocol's `Code` (`bad_snapshot`, `bad_request`, ...).
 * `Check` and `Fmt` do what `figram check` and `figram fmt` do (a misspelt key such as `"iff"` is
   an error).
@@ -34,7 +35,7 @@ import figram "github.com/Ruddy35/ffl-go"
 ## Installation
 
 ```sh
-go get github.com/Ruddy35/ffl-go@v0.2.0
+go get github.com/Ruddy35/ffl-go@v0.3.0
 ```
 
 ## Quick start
@@ -103,13 +104,22 @@ does; the result has `Recovered` set. Do not deliver the event again after that.
 | `Kind` | Meaning |
 |---|---|
 | `figram.Send` | send the message `Name` to the user |
-| `figram.Call` | run your action `Name` (an order, a payment, ...) |
+| `figram.Call` | run your action `Name` (an order, a payment, ...); `Outcomes`: deliver its outcome with `Token`; `Detached`: a background action |
 | `figram.StartTimer` | start the timer `Name` for `Ms` milliseconds; keep `Token` |
 | `figram.CancelTimer` | cancel the timer `Name` |
 
 **Timers.** When a timer fires, call `bot.Timer(snapshot, name, token, nil)` with the token of
 its `start_timer` action. A stale token, or a timer of a message the user already left, changes
 nothing.
+
+**Outcomes.** An action declared with `"outcomes"` in the document reports how it ended. Its
+`Call` has `Outcomes` set and a `Token`, and the snapshot waits for it (`Snapshot.Pending`).
+After performing the action, deliver exactly one outcome:
+`bot.Outcome(snapshot, a.Name, "created", a.Token, nil)` with a declared outcome, or `"failed"`
+when you give up without an answer (reconcile with the external system first: the host
+contract, section 2). The outcome is handled by the arrows of the message the user is on then;
+a stale or repeated outcome changes nothing. A `Call` with `Detached` set is a background action:
+run it later and in any order, the user's next event does not wait for it.
 
 **Conditions.** An arrow can depend on conditions (`"if": "cart_not_empty"`) that only the host
 can evaluate. Pass known values in `guards`; if the step (or `StartWith`) needs others, the
@@ -125,16 +135,19 @@ res, err := figram.Decide(nil, cartNotEmpty, func(g map[string]bool) (*figram.Re
 **Errors.** `*figram.DocumentError` (from `Load`, `Check`, `Fmt`) lists the problems of a
 document. `*figram.ProtocolError` is an error reply of the engine: decide by its `Code`
 (`figram.CodeBadSnapshot`, `figram.CodeBadRequest`, `figram.CodeSeqOverflow`,
-`figram.CodeTooLarge`, `figram.CodeParseError`), not by the text. After `Close`, calls return
+`figram.CodeSnapshotTooLarge`, `figram.CodeTooLarge`, `figram.CodeParseError`), not by the text.
+`CodeSnapshotTooLarge` means that the user has as many unanswered waits as the request limit
+allows (`SetMaxRequest`): the step is refused, the stored snapshot still works for its outcomes
+and `Restart`. After `Close`, calls return
 `figram.ErrClosed`.
 
 **Delivery guarantees.** Storing snapshots, executing actions exactly once and handling timers
 across retries and crashes follow the
-[host contract](https://github.com/Ruddy35/figram-fsm-library/blob/v0.2.0/docs/host-contract.md)
+[host contract](https://github.com/Ruddy35/figram-fsm-library/blob/v0.3.0/docs/host-contract.md)
 (idempotency keys `user:seq:index`, the order of steps per user).
 
 **Raw protocol.** `bot.Request(line)` sends one request line of the
-[engine protocol](https://github.com/Ruddy35/figram-fsm-library/blob/v0.2.0/docs/format.md#8-snapshot-and-engine-protocol-version-2)
+[engine protocol](https://github.com/Ruddy35/figram-fsm-library/blob/v0.3.0/docs/format.md#8-snapshot-and-engine-protocol-version-3)
 and returns the reply line unchecked.
 
 ## Building
@@ -157,28 +170,27 @@ imports so that vendoring copies it.
 
 The bundled libraries are for linux/amd64. Elsewhere build the library from the Figram sources
 (`ffi/build.sh`, see the
-[embedding guide](https://github.com/Ruddy35/figram-fsm-library/blob/v0.2.0/docs/embedding.md))
+[embedding guide](https://github.com/Ruddy35/figram-fsm-library/blob/v0.3.0/docs/embedding.md))
 and build with the tag `figram_system`, which takes the library from pkg-config:
 
 ```sh
 PKG_CONFIG_PATH=/path/to/libfigram/lib/pkgconfig go build -tags figram_system
 ```
 
-The same tag links the release archive `libfigram-0.2.0-linux-x86_64.tar.gz` unpacked anywhere
+The same tag links the release archive `libfigram-0.3.0-linux-x86_64.tar.gz` unpacked anywhere
 (its `lib/pkgconfig/figram.pc` is relocatable). The Go build cache does not notice another
 library behind `PKG_CONFIG_PATH`: after switching to another library, rebuild with `go build -a`
 (or `go clean -cache`).
 
 ## Versioning
 
-The module version follows the Figram release whose libraries it bundles
-(`figram.BundledVersion`): ffl-go v0.2.0 bundles Figram v0.2.0 and speaks protocol version 2
-(`figram.ProtocolVersion`); `Load` rejects a library of another protocol version, which the
-build tag `figram_system` could link. ffl-go v0.1.0 speaks protocol 1 and works only with
-Figram v0.1.0. `scripts/update-lib.sh VERSION` replaces the libraries, the header and the test
+The module version follows the Figram release whose libraries it bundles (`figram.BundledVersion`):
+ffl-go v0.3.0 bundles Figram v0.3.0 and speaks protocol version 3 (`figram.ProtocolVersion`);
+`Load` rejects a library of another protocol version, which the build tag `figram_system` could
+link. ffl-go v0.2.0 speaks protocol 2 and works only with Figram v0.2.0, ffl-go v0.1.0 protocol 1
+with Figram v0.1.0. `scripts/update-lib.sh VERSION` replaces the libraries, the header and the test
 data with those of another release, verified with the release's `SHA256SUMS`;
-`scripts/update-lib.sh --check` (run by CI) checks that the tree equals the release byte for
-byte.
+`scripts/update-lib.sh --check` (run by CI) checks that the tree equals the release byte for byte.
 
 ## Development
 
