@@ -85,8 +85,12 @@ The runnable examples of the package (`example_test.go`) cover conditions and ti
 
 **Snapshots.** Store `res.Snapshot` as JSON (for example in a database row of the user) and pass
 it back with the user's next event. The engine rejects a snapshot it does not understand with
-`bad_snapshot`, so a snapshot is never misread. Store it as the engine returned it: fields such
-as `Back` (where "back" leads) are part of the user's state.
+`bad_snapshot`, so a snapshot is never misread. Store all of its fields: `Back` (where "back"
+leads) and `Pending` (the awaited outcomes) are part of the user's state. The maps `Resume` and
+`Timers` do not keep the order of the engine's keys; the engine then cancels the timers of a
+`Restart` or a recovery in another order than for its own JSON, which does not matter to a
+scheduler that follows the host contract (section 3). A host that must reproduce the engine's
+replies byte for byte stores the raw reply lines of `bot.Request`.
 
 **New users.** A user without a snapshot who comes with an update (a command such as
 `/start ref123`, or a button of an old message) is started with
@@ -110,7 +114,7 @@ does; the result has `Recovered` set. Do not deliver the event again after that.
 
 **Timers.** When a timer fires, call `bot.Timer(snapshot, name, token, nil)` with the token of
 its `start_timer` action. A stale token, or a timer of a message the user already left, changes
-nothing.
+nothing, unless the snapshot's message is no longer in the document (`Recovered`, below).
 
 **Outcomes.** An action declared with `"outcomes"` in the document reports how it ended. Its
 `Call` has `Outcomes` set and a `Token`, and the snapshot waits for it (`Snapshot.Pending`).
@@ -118,7 +122,9 @@ After performing the action, deliver exactly one outcome:
 `bot.Outcome(snapshot, a.Name, "created", a.Token, nil)` with a declared outcome, or `"failed"`
 when you give up without an answer (reconcile with the external system first: the host
 contract, section 2). The outcome is handled by the arrows of the message the user is on then;
-a stale or repeated outcome changes nothing. A `Call` with `Detached` set is a background action:
+a stale or repeated outcome changes nothing (again, unless the snapshot's message is no longer
+in the document). The action's name may contain `:`, the outcome's may not. A `Call` with
+`Detached` set is a background action:
 run it later and in any order, the user's next event does not wait for it.
 
 **Conditions.** An arrow can depend on conditions (`"if": "cart_not_empty"`) that only the host
@@ -136,10 +142,11 @@ res, err := figram.Decide(nil, cartNotEmpty, func(g map[string]bool) (*figram.Re
 document. `*figram.ProtocolError` is an error reply of the engine: decide by its `Code`
 (`figram.CodeBadSnapshot`, `figram.CodeBadRequest`, `figram.CodeSeqOverflow`,
 `figram.CodeSnapshotTooLarge`, `figram.CodeTooLarge`, `figram.CodeParseError`), not by the text.
-`CodeSnapshotTooLarge` means that the user has as many unanswered waits as the request limit
-allows (`SetMaxRequest`): the step is refused, the stored snapshot still works for its outcomes
-and `Restart`. After `Close`, calls return
-`figram.ErrClosed`.
+`CodeSnapshotTooLarge`: the new snapshot would take more than 15/16 of the request limit
+(`SetMaxRequest`), usually because of waits nobody answers (a snapshot also grows with timers and
+remembered places); the step is refused, and the stored snapshot still works for its outcomes and
+`Restart`. A request whose strings are not valid UTF-8 fails with `CodeParseError` before it is
+sent. After `Close`, calls return `figram.ErrClosed`.
 
 **Delivery guarantees.** Storing snapshots, executing actions exactly once and handling timers
 across retries and crashes follow the

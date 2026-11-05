@@ -57,7 +57,9 @@ func Init() error {
 
 // SetMaxRequest sets the request size limit in bytes for the whole process (0: no limit) and
 // returns the previous limit. The default is 1 MiB, as in figram-engine. A longer request fails
-// with a [ProtocolError] with code [CodeTooLarge].
+// with a [ProtocolError] with code [CodeTooLarge]; a step whose new snapshot would take more than
+// 15/16 of the limit fails with [CodeSnapshotTooLarge], so that the stored snapshot always fits
+// into the next request.
 func SetMaxRequest(n int) int {
 	if n < 0 {
 		n = 0

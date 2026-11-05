@@ -27,8 +27,9 @@ with them.
   works for its outcomes and `Restart`.
 - Tests: the golden scenarios of v0.3.0 (outcomes with their tokens, background actions,
   arrows without a target), `Outcome` with a stale, an accepted and a repeated token and with
-  `Decide`, the snapshot size limit, the protocol 3 rows of the reply validator, an example, and
-  seven more wrapper mutants (23).
+  `Decide` and with an action name containing `:`, `Timer` with `Need`, the snapshot size limit
+  (also with names that JSON encoders escape), invalid UTF-8, the protocol 3 rows and every
+  field check of the reply validator, an example, and 21 more wrapper mutants (37).
 
 ### Changed
 
@@ -37,6 +38,31 @@ with them.
   address space, no more memory in use).
 - `ProtocolVersion` is 3; `Load` rejects a library of another protocol version. The reply
   validator accepts `pending` in snapshots and `token` and `detached` in `call` actions.
+
+### Fixed
+
+- Requests are encoded as the engine encodes JSON: `&`, `<`, `>` without HTML escapes, U+2028 and
+  U+2029 as UTF-8. With the escapes of `encoding/json`, a snapshot the engine kept within 15/16 of
+  the request limit could exceed the limit when sent back, and its outcomes and `Restart` failed
+  with `too_large` (found by an audit of this release).
+- A request whose strings are not valid UTF-8 fails with `CodeParseError` before it is sent; before,
+  `encoding/json` replaced the invalid bytes with U+FFFD and the engine got another event or
+  snapshot.
+- The reply validator rejects duplicate entries in `need` and any text after the reply (before, a
+  `}` or `]` after it passed).
+- `Result.MarshalJSON` writes the fields in the engine's order (`snapshot`, `actions`,
+  `recovered`).
+- Documentation: a stale or repeated outcome or timer changes nothing unless the snapshot's
+  message is no longer in the document (`Recovered`); `Restart` clears the waits and `back`;
+  `CodeSnapshotTooLarge` also comes from timers and remembered places.
+
+### Known issues
+
+- The maps `Snapshot.Resume` and `Snapshot.Timers` do not keep the order of the engine's keys. The
+  engine cancels the timers of a `Restart` or a recovery in the order of the snapshot's keys, so
+  the `cancel_timer` actions may come in another order than for the engine's own JSON; for a
+  scheduler that follows the host contract the order does not matter. To reproduce the engine's
+  replies byte for byte, store the raw reply lines of `Bot.Request`.
 
 ## [0.2.0] - 2026-10-26
 
