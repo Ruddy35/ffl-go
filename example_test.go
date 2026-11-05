@@ -123,3 +123,33 @@ func ExampleBot_Timer() {
 	// start idle for 60000 ms, token 1
 	// after the timer: home []
 }
+
+// An action with outcomes: the call carries a token, and its outcome comes back as an event with
+// that token. Here the CRM answers create_order with "created".
+func ExampleBot_Outcome() {
+	doc, _ := os.ReadFile("testdata/pizza.bot.json")
+	bot, err := figram.Load(string(doc))
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer bot.Close()
+	pay := figram.Snapshot{At: "pay", Resume: map[string]string{"order": "pay"}, Seq: 5}
+	res, err := bot.Step(pay, "payment:success", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, a := range res.Actions {
+		if a.Kind == figram.Call && a.Outcomes {
+			fmt.Printf("call %s, token %d; waiting: %v\n", a.Name, a.Token, res.Snapshot.Pending)
+			done, err := bot.Outcome(res.Snapshot, a.Name, "created", a.Token, nil)
+			if err != nil {
+				log.Fatal(err)
+			}
+			b, _ := json.Marshal(done.Actions)
+			fmt.Println(done.Snapshot.At, string(b))
+		}
+	}
+	// Output:
+	// call create_order, token 6; waiting: [{create_order 6}]
+	// done [{"call":"notify_kitchen","detached":true},{"send":"done"}]
+}

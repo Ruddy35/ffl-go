@@ -3,14 +3,17 @@
 package figram
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
-// The typed engine protocol, version 2 (docs/format.md, section 8, in the Figram repository).
+// The typed engine protocol, version 3 (docs/format.md, section 8, in the Figram repository).
 // Every reply is checked strictly: the id echo, exactly one reply variant, the field types and
 // value ranges; a reply that breaks the protocol is an error, never a partial result.
 
@@ -19,18 +22,30 @@ const MaxInt = 1<<53 - 1
 
 // ProtocolVersion is the version of the engine protocol this package speaks; [Load] rejects a
 // library that speaks another one (possible with the build tag figram_system).
-const ProtocolVersion = 2
+const ProtocolVersion = 3
 
 // Snapshot is the state of one user, kept by the host between events (in a database, for
-// example) and passed back with the next request. Store it as its JSON encoding; the engine
-// rejects unknown fields.
+// example) and passed back with the next request. Store it as its JSON encoding, with all its
+// fields; the engine rejects unknown fields. The maps Resume and Timers do not keep the order of
+// the engine's keys: on [Bot.Restart] and on recovery the engine cancels the snapshot's timers in
+// the order of its keys, so the cancel_timer actions may come in another order than for the
+// engine's own JSON (cancellations commute, docs/host-contract.md, section 3). A host that must
+// reproduce the engine's replies byte for byte sends and stores the raw lines ([Bot.Request]).
 type Snapshot struct {
-	V      int               `json:"v,omitempty"`      // version; 0 means 1
-	At     string            `json:"at"`               // the current message
-	Back   string            `json:"back,omitempty"`   // the message "back" leads to (left at the last section crossing)
-	Resume map[string]string `json:"resume,omitempty"` // section → message: the places "resume" leads to
-	Timers map[string]uint64 `json:"timers,omitempty"` // timer → token: the active timers
-	Seq    uint64            `json:"seq,omitempty"`    // the number of the last transition
+	V       int               `json:"v,omitempty"`       // version; 0 means 1
+	At      string            `json:"at"`                // the current message
+	Back    string            `json:"back,omitempty"`    // the message "back" leads to (left at the last section crossing)
+	Resume  map[string]string `json:"resume,omitempty"`  // section → message: the places "resume" leads to
+	Timers  map[string]uint64 `json:"timers,omitempty"`  // timer → token: the active timers
+	Pending []Wait            `json:"pending,omitempty"` // the calls whose outcome is awaited, newest first
+	Seq     uint64            `json:"seq,omitempty"`     // the number of the last transition
+}
+
+// Wait is a call of an action with outcomes whose outcome has not come yet: [Bot.Outcome] with
+// this action and token is accepted once.
+type Wait struct {
+	Call  string `json:"call"`  // the action
+	Token uint64 `json:"token"` // the token of the call
 }
 
 // ActionKind is the kind of an [Action].
@@ -39,7 +54,7 @@ type ActionKind string
 // The actions the host executes, in the order of [Result.Actions].
 const (
 	Send        ActionKind = "send"         // send the message Name to the user
-	Call        ActionKind = "call"         // run the action Name of the host
+	Call        ActionKind = "call"         // run the action Name of the host (see Outcomes, Detached)
 	StartTimer  ActionKind = "start_timer"  // start the timer Name for Ms milliseconds with Token
 	CancelTimer ActionKind = "cancel_timer" // cancel the timer Name
 )
@@ -49,14 +64,31 @@ type Action struct {
 	Kind  ActionKind
 	Name  string // the message (Send), the action (Call) or the timer (StartTimer, CancelTimer)
 	Ms    uint64 // StartTimer: the delay in milliseconds
-	Token uint64 // StartTimer: the token to pass to [Bot.Timer] when the timer fires
+	Token uint64 // StartTimer: the token to pass to [Bot.Timer]; Call with Outcomes: to [Bot.Outcome] (0 and not written otherwise)
+	// Outcomes (Call): the action reports how it ended. After performing it, deliver exactly one
+	// outcome with [Bot.Outcome] and Token: a declared outcome, or "failed" when the host gives
+	// up without an answer (reconcile first: docs/host-contract.md, section 2).
+	Outcomes bool
+	// Detached (Call): a background action. Run it later and in any order; the user's next event
+	// does not wait for it.
+	Detached bool
 }
 
 // MarshalJSON writes the protocol form, e.g. {"start_timer":"t","ms":5000,"token":3}.
 func (a Action) MarshalJSON() ([]byte, error) {
 	switch a.Kind {
-	case Send, Call, CancelTimer:
+	case Send, CancelTimer:
 		return json.Marshal(map[string]string{string(a.Kind): a.Name})
+	case Call:
+		c := struct {
+			Name     string  `json:"call"`
+			Token    *uint64 `json:"token,omitempty"`
+			Detached bool    `json:"detached,omitempty"`
+		}{Name: a.Name, Detached: a.Detached}
+		if a.Outcomes {
+			c.Token = &a.Token
+		}
+		return json.Marshal(c)
 	case StartTimer:
 		return json.Marshal(struct {
 			Name  string `json:"start_timer"`
@@ -91,26 +123,29 @@ type Result struct {
 	// Actions are executed by the host in this order.
 	Actions []Action
 	// Recovered: the snapshot's message is not in the document (it was edited). The old timers
-	// were cancelled, the remembered places kept, and the event was processed as [Bot.StartWith]
-	// processes it (a timer event starts the user over). Do not deliver the event again: it has
-	// been processed.
+	// were cancelled, the remembered places and the waits kept, and the event was processed as at
+	// the initial message, as [Bot.StartWith] processes it; a timer event, and an outcome the
+	// snapshot does not wait for, start the user over, while an awaited outcome is accepted. Do
+	// not deliver the event again: it has been processed. This happens for any event, a stale or
+	// repeated one included.
 	Recovered bool
 }
 
-// MarshalJSON writes the protocol form of the reply: {"need": [...]} or {"snapshot": ...,
-// "actions": [...]} with "recovered": true when set.
+// MarshalJSON writes the protocol form of the reply, in the engine's field order: {"need": [...]}
+// or {"snapshot": ..., "actions": [...]} with "recovered": true when set.
 func (r Result) MarshalJSON() ([]byte, error) {
 	if len(r.Need) > 0 {
 		return json.Marshal(map[string]any{"need": r.Need})
 	}
-	m := map[string]any{"snapshot": r.Snapshot, "actions": r.Actions}
-	if r.Actions == nil {
-		m["actions"] = []Action{}
+	acts := r.Actions
+	if acts == nil {
+		acts = []Action{}
 	}
-	if r.Recovered {
-		m["recovered"] = true
-	}
-	return json.Marshal(m)
+	return json.Marshal(struct {
+		Snapshot  Snapshot `json:"snapshot"`
+		Actions   []Action `json:"actions"`
+		Recovered bool     `json:"recovered,omitempty"`
+	}{r.Snapshot, acts, r.Recovered})
 }
 
 // Hello is the reply to [Bot.Hello].
@@ -126,14 +161,23 @@ const (
 	CodeBadRequest  = "bad_request"  // a wrong field: an empty event, a token without a timer event, ...
 	CodeBadSnapshot = "bad_snapshot" // the snapshot is not accepted
 	CodeSeqOverflow = "seq_overflow" // the new seq would exceed MaxInt
+	// CodeSnapshotTooLarge: the new snapshot would take more than 15/16 of the request size limit
+	// ([SetMaxRequest]); the stored snapshot still works for the outcomes and [Bot.Restart].
+	CodeSnapshotTooLarge = "snapshot_too_large"
 )
+
+// A request whose strings are not valid UTF-8 fails before it is sent, with code
+// [CodeParseError], as the library rejects such a raw request ([Bot.Request]); encoding/json would
+// replace the invalid bytes with U+FFFD instead.
 
 var errorCodes = map[string]bool{
 	CodeParseError: true, CodeTooLarge: true, CodeBadRequest: true, CodeBadSnapshot: true, CodeSeqOverflow: true,
+	CodeSnapshotTooLarge: true,
 }
 
-// ProtocolError is an error reply of the engine. The snapshot of the request is unchanged, and
-// repeating the same request gives the same error.
+// ProtocolError is an error reply of the engine (or invalid UTF-8 in a request, detected before
+// it is sent). The snapshot of the request is unchanged, and repeating the same request gives
+// the same error.
 type ProtocolError struct {
 	Code    string // one of the Code constants
 	Message string // for humans; it may change between versions
@@ -182,8 +226,9 @@ func startFields(seq uint64) map[string]any {
 	return f
 }
 
-// Restart starts the user over: it cancels the snapshot's timers, clears the remembered places
-// and enters the bot again, continuing the seq counter.
+// Restart starts the user over: it cancels the snapshot's timers, clears the remembered places,
+// the place to go back to and the waits for outcomes (outcomes of calls still in flight are then
+// ignored), and enters the bot again, continuing the seq counter.
 func (b *Bot) Restart(s Snapshot) (*Result, error) {
 	return b.result("restart", map[string]any{"snapshot": s})
 }
@@ -201,9 +246,28 @@ func (b *Bot) Step(s Snapshot, event string, guards map[string]bool) (*Result, e
 
 // Timer processes the firing of a timer started by a [StartTimer] action: timer is its Name and
 // token its Token. A firing with a stale token, or after the user left the message, changes
-// nothing (the result has the same snapshot and no actions).
+// nothing (the result has the same snapshot and no actions), unless the snapshot's message is no
+// longer in the document ([Result.Recovered]). guards and Need work as for [Bot.Step].
 func (b *Bot) Timer(s Snapshot, timer string, token uint64, guards map[string]bool) (*Result, error) {
 	f := map[string]any{"snapshot": s, "event": "timer:" + timer, "token": token}
+	if len(guards) > 0 {
+		f["guards"] = guards
+	}
+	return b.result("step", f)
+}
+
+// Outcome processes the outcome of a call of an action with outcomes ([Action.Outcomes]): action
+// is its Name (it may contain ':'), outcome a declared outcome of it or "failed" (without ':'),
+// token its Token. The engine accepts it once, only while the snapshot waits for that call
+// ([Snapshot.Pending]), and then handles it like any event, by the arrows of the message the user
+// is on; a stale or repeated outcome changes nothing, unless the snapshot's message is no longer
+// in the document ([Result.Recovered]). guards and Need work as for [Bot.Step].
+func (b *Bot) Outcome(s Snapshot, action, outcome string, token uint64, guards map[string]bool) (*Result, error) {
+	if action == "" || outcome == "" || strings.Contains(outcome, ":") {
+		return nil, fmt.Errorf("figram: outcome event: action %q, outcome %q (both non-empty, no ':' in the outcome)",
+			action, outcome)
+	}
+	f := map[string]any{"snapshot": s, "event": "call:" + action + ":" + outcome, "token": token}
 	if len(guards) > 0 {
 		f["guards"] = guards
 	}
@@ -271,7 +335,12 @@ func (b *Bot) call(op string, fields map[string]any) (map[string]any, error) {
 	}
 	msg["op"] = op
 	msg["id"] = id
-	line, err := json.Marshal(msg)
+	for k, v := range msg {
+		if !validUTF8(v) {
+			return nil, &ProtocolError{Code: CodeParseError, Message: "request is not valid UTF-8 (field " + k + ")"}
+		}
+	}
+	line, err := encodeLine(msg)
 	if err != nil {
 		return nil, fmt.Errorf("figram: request cannot be encoded: %w", err)
 	}
@@ -298,14 +367,80 @@ func (b *Bot) call(op string, fields map[string]any) (map[string]any, error) {
 	return r, nil
 }
 
+// encodeLine writes a request as the engine writes JSON, so that its size is the size the engine
+// measures: without the HTML escapes of encoding/json (& < > as \u0026 ...) and with U+2028 and
+// U+2029 as UTF-8, not \u2028 and \u2029 (encoding/json escapes these always). The engine keeps
+// a new snapshot within 15/16 of the request limit in its own encoding; a longer encoding of the
+// same snapshot could exceed the limit, and its outcomes and Restart would fail with too_large.
+func encodeLine(msg any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(msg); err != nil {
+		return nil, err
+	}
+	return unescapeLineSeparators(bytes.TrimSuffix(buf.Bytes(), []byte("\n"))), nil
+}
+
+// unescapeLineSeparators replaces the escapes \u2028 and \u2029 of encoding/json by the characters.
+// In its output a backslash always starts an escape, so the escapes are read pairwise.
+func unescapeLineSeparators(b []byte) []byte {
+	if !bytes.Contains(b, []byte(`\u202`)) {
+		return b
+	}
+	out := make([]byte, 0, len(b))
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\\' || i+1 >= len(b) {
+			out = append(out, b[i])
+			continue
+		}
+		if b[i+1] == 'u' && i+5 < len(b) && string(b[i+2:i+5]) == "202" && (b[i+5] == '8' || b[i+5] == '9') {
+			out = utf8.AppendRune(out, rune(0x2020+int(b[i+5]-'0')))
+			i += 5
+			continue
+		}
+		out = append(out, b[i], b[i+1])
+		i++
+	}
+	return out
+}
+
+// validUTF8 reports whether the strings of a request field are valid UTF-8.
+func validUTF8(v any) bool {
+	switch x := v.(type) {
+	case string:
+		return utf8.ValidString(x)
+	case map[string]bool:
+		for k := range x {
+			if !utf8.ValidString(k) {
+				return false
+			}
+		}
+	case Snapshot:
+		ok := utf8.ValidString(x.At) && utf8.ValidString(x.Back)
+		for k, v := range x.Resume {
+			ok = ok && utf8.ValidString(k) && utf8.ValidString(v)
+		}
+		for k := range x.Timers {
+			ok = ok && utf8.ValidString(k)
+		}
+		for _, w := range x.Pending {
+			ok = ok && utf8.ValidString(w.Call)
+		}
+		return ok
+	}
+	return true
+}
+
+// decodeJSON reads exactly one JSON value; only whitespace may follow it.
 func decodeJSON(b []byte) (any, error) {
 	var v any
-	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.UseNumber()
 	if err := dec.Decode(&v); err != nil {
 		return nil, err
 	}
-	if dec.More() {
+	if rest := bytes.TrimFunc(b[dec.InputOffset():], unicode.IsSpace); len(rest) != 0 {
 		return nil, errors.New("text after the JSON value")
 	}
 	return v, nil
@@ -346,7 +481,7 @@ func checkSnapshot(v any) error {
 	}
 	for k := range s {
 		switch k {
-		case "v", "at", "back", "resume", "timers", "seq":
+		case "v", "at", "back", "resume", "timers", "pending", "seq":
 		default:
 			return fmt.Errorf("snapshot: unknown field %q", k)
 		}
@@ -382,6 +517,18 @@ func checkSnapshot(v any) error {
 			}
 		}
 	}
+	if p, ok := s["pending"]; ok {
+		l, ok := p.([]any)
+		if !ok {
+			return fmt.Errorf("snapshot.pending is not a list")
+		}
+		for _, w := range l {
+			m, ok := w.(map[string]any)
+			if !ok || !keysAre(m, "call", "token") || !nameOK(m["call"]) || !natOK(m["token"]) {
+				return fmt.Errorf("snapshot.pending: %v", w)
+			}
+		}
+	}
 	if q, ok := s["seq"]; ok && !natOK(q) {
 		return fmt.Errorf("snapshot.seq: %v", q)
 	}
@@ -394,11 +541,23 @@ func checkAction(a any) error {
 		return fmt.Errorf("action is not an object: %v", a)
 	}
 	switch {
-	case keysAre(m, "send"), keysAre(m, "call"), keysAre(m, "cancel_timer"):
+	case keysAre(m, "send"), keysAre(m, "cancel_timer"):
 		for _, x := range m {
 			if !nameOK(x) {
 				return fmt.Errorf("action: %v", m)
 			}
+		}
+	case keysAre(m, "call"), keysAre(m, "call", "token"), keysAre(m, "call", "detached"),
+		keysAre(m, "call", "token", "detached"):
+		// token: an action with outcomes; detached: a background action, written only as true
+		if !nameOK(m["call"]) {
+			return fmt.Errorf("call: %v", m)
+		}
+		if t, ok := m["token"]; ok && !natOK(t) {
+			return fmt.Errorf("call.token: %v", m)
+		}
+		if d, ok := m["detached"]; ok && d != true {
+			return fmt.Errorf("call.detached: %v", m)
 		}
 	case keysAre(m, "start_timer", "ms", "token"):
 		if !nameOK(m["start_timer"]) || !natOK(m["ms"]) || !natOK(m["token"]) {
@@ -466,10 +625,12 @@ func checkReply(r map[string]any, id int64, op string) (string, error) {
 		if !ok || len(need) == 0 {
 			return "", fmt.Errorf("need: %v", rest["need"])
 		}
+		seen := map[string]bool{}
 		for _, n := range need {
-			if !nameOK(n) {
+			if !nameOK(n) || seen[n.(string)] {
 				return "", fmt.Errorf("need: %v", n)
 			}
+			seen[n.(string)] = true
 		}
 		return "need", nil
 	}
@@ -514,6 +675,13 @@ func toSnapshot(m map[string]any) Snapshot {
 			s.Timers[k] = toUint(v)
 		}
 	}
+	if p, ok := m["pending"].([]any); ok {
+		s.Pending = make([]Wait, 0, len(p))
+		for _, w := range p {
+			wm := w.(map[string]any)
+			s.Pending = append(s.Pending, Wait{Call: wm["call"].(string), Token: toUint(wm["token"])})
+		}
+	}
 	if q, ok := m["seq"]; ok {
 		s.Seq = toUint(q)
 	}
@@ -523,6 +691,13 @@ func toSnapshot(m map[string]any) Snapshot {
 func toAction(m map[string]any) Action {
 	if name, ok := m["start_timer"]; ok {
 		return Action{Kind: StartTimer, Name: name.(string), Ms: toUint(m["ms"]), Token: toUint(m["token"])}
+	}
+	if name, ok := m["call"]; ok {
+		a := Action{Kind: Call, Name: name.(string), Detached: m["detached"] == true}
+		if t, ok := m["token"]; ok {
+			a.Outcomes, a.Token = true, toUint(t)
+		}
+		return a
 	}
 	for k, v := range m {
 		return Action{Kind: ActionKind(k), Name: v.(string)}

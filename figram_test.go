@@ -101,7 +101,11 @@ func run(b *Bot, s scenario) string {
 	for i, st := range s.Steps {
 		var r *Result
 		var err error
-		if st.Token != nil {
+		if st.Token != nil && strings.HasPrefix(st.Event, "call:") {
+			// call:<action>:<outcome>: the action may contain ':', the outcome may not
+			i := strings.LastIndexByte(st.Event, ':')
+			r, err = b.Outcome(snap, st.Event[len("call:"):i], st.Event[i+1:], *st.Token, st.Guards)
+		} else if st.Token != nil {
 			r, err = b.Timer(snap, strings.TrimPrefix(st.Event, "timer:"), *st.Token, st.Guards)
 		} else {
 			r, err = b.Step(snap, st.Event, st.Guards)
@@ -165,7 +169,7 @@ func TestGoldenConcurrent(t *testing.T) {
 
 func TestHello(t *testing.T) {
 	h, err := load(t, "pizza.bot.json").Hello()
-	if err != nil || h != (Hello{Protocol: ProtocolVersion, States: 11}) || ProtocolVersion != 2 {
+	if err != nil || h != (Hello{Protocol: ProtocolVersion, States: 13}) || ProtocolVersion != 3 {
 		t.Fatalf("Hello = %+v, %v", h, err)
 	}
 }
@@ -231,7 +235,8 @@ func TestStartWith(t *testing.T) {
 	}
 	r, err = Decide(nil, func(string) (bool, error) { return true, nil },
 		func(g map[string]bool) (*Result, error) { return b.StartWith(0, "btn:go", g) })
-	want := &Result{Snapshot: Snapshot{At: "vip", Seq: 1}, Actions: []Action{{Kind: Send, Name: "vip"}}}
+	want := &Result{Snapshot: Snapshot{At: "vip", Timers: map[string]uint64{"nudge": 1}, Seq: 1},
+		Actions: []Action{{Kind: StartTimer, Name: "nudge", Ms: 30000, Token: 1}, {Kind: Send, Name: "vip"}}}
 	if err != nil || !reflect.DeepEqual(r, want) {
 		t.Fatalf("Decide(StartWith) = %s, %v", dump(r), err)
 	}
@@ -324,7 +329,7 @@ func second(_ *Result, err error) error { return err }
 func TestRawRequest(t *testing.T) {
 	b := load(t, "pizza.bot.json")
 	cases := map[string]string{
-		`{"id":1,"op":"hello"}`: `{"id":1,"protocol":2,"states":11}`,
+		`{"id":1,"op":"hello"}`: `{"id":1,"protocol":3,"states":13}`,
 		`{"id":8,"op":"step","snapshot":{"at":"cart"},"event":"btn:checkout","gaurds":{}}`: `{"id":8,"error":"unknown request field ` +
 			"`gaurds`" + `","code":"bad_request"}`,
 		``:    `"code":"parse_error"`,
@@ -402,9 +407,12 @@ func TestActionJSON(t *testing.T) {
 	acts := []Action{
 		{Kind: Send, Name: "menu"}, {Kind: Call, Name: "pay"}, {Kind: CancelTimer, Name: "t"},
 		{Kind: StartTimer, Name: "t", Ms: 0, Token: 7},
+		{Kind: Call, Name: "create_order", Token: 6, Outcomes: true}, {Kind: Call, Name: "log", Detached: true},
+		{Kind: Call, Name: "ping", Token: 8, Outcomes: true, Detached: true},
 	}
 	b, err := json.Marshal(acts)
-	if err != nil || string(b) != `[{"send":"menu"},{"call":"pay"},{"cancel_timer":"t"},{"start_timer":"t","ms":0,"token":7}]` {
+	if err != nil || string(b) != `[{"send":"menu"},{"call":"pay"},{"cancel_timer":"t"},{"start_timer":"t","ms":0,"token":7},`+
+		`{"call":"create_order","token":6},{"call":"log","detached":true},{"call":"ping","token":8,"detached":true}]` {
 		t.Fatalf("Marshal = %s, %v", b, err)
 	}
 	var back []Action
@@ -412,6 +420,7 @@ func TestActionJSON(t *testing.T) {
 		t.Fatalf("Unmarshal = %+v, %v", back, err)
 	}
 	for _, bad := range []string{`{"send":""}`, `{"send":"a","call":"b"}`, `{"start_timer":"t","ms":-1,"token":1}`,
+		`{"call":"a","detached":false}`, `{"call":"a","token":-1}`, `{"call":"a","outcome":"x"}`,
 		`{"start_timer":"t","ms":1.5,"token":1}`, `{"start_timer":"t","ms":1}`, `{"jump":"x"}`, `"send"`} {
 		var a Action
 		if err := json.Unmarshal([]byte(bad), &a); err == nil {
@@ -424,10 +433,11 @@ func TestActionJSON(t *testing.T) {
 }
 
 func TestSnapshotJSON(t *testing.T) {
-	s := Snapshot{At: "a", Back: "b", Resume: map[string]string{"s": "a"}, Timers: map[string]uint64{"t": 0}, Seq: 5}
+	s := Snapshot{At: "a", Back: "b", Resume: map[string]string{"s": "a"}, Timers: map[string]uint64{"t": 0},
+		Pending: []Wait{{Call: "ping", Token: 5}, {Call: "ping", Token: 4}}, Seq: 5}
 	b, _ := json.Marshal(s)
 	// The field order of the engine.
-	if string(b) != `{"at":"a","back":"b","resume":{"s":"a"},"timers":{"t":0},"seq":5}` {
+	if string(b) != `{"at":"a","back":"b","resume":{"s":"a"},"timers":{"t":0},"pending":[{"call":"ping","token":5},{"call":"ping","token":4}],"seq":5}` {
 		t.Fatalf("Marshal = %s", b)
 	}
 	var back Snapshot
@@ -443,14 +453,234 @@ func TestSnapshotJSON(t *testing.T) {
 func TestResultJSON(t *testing.T) {
 	cases := map[string]Result{
 		`{"need":["c"]}`:                       {Need: []string{"c"}},
-		`{"actions":[],"snapshot":{"at":"a"}}`: {Snapshot: Snapshot{At: "a"}},
-		`{"actions":[{"send":"a"}],"recovered":true,"snapshot":{"at":"a","seq":2}}`: {
+		`{"snapshot":{"at":"a"},"actions":[]}`: {Snapshot: Snapshot{At: "a"}},
+		`{"snapshot":{"at":"a","seq":2},"actions":[{"send":"a"}],"recovered":true}`: {
 			Snapshot: Snapshot{At: "a", Seq: 2}, Actions: []Action{{Kind: Send, Name: "a"}}, Recovered: true},
 	}
 	for want, r := range cases {
 		if b, err := json.Marshal(r); err != nil || string(b) != want {
 			t.Errorf("Marshal(%+v) = %s, %v; want %s", r, b, err, want)
 		}
+	}
+}
+
+// An action with outcomes (docs/format.md, section 7, decision 12): the call carries a token, the
+// snapshot waits for it, the outcome with that token is accepted once and handled by the arrows of
+// the message the user is on; a stale token changes nothing.
+func TestOutcome(t *testing.T) {
+	b := load(t, "pizza.bot.json")
+	pay := Snapshot{At: "pay", Resume: map[string]string{"order": "pay"}, Seq: 5}
+	r, err := b.Step(pay, "payment:success", nil)
+	want := &Result{
+		Snapshot: Snapshot{At: "placing", Resume: map[string]string{"order": "placing"},
+			Pending: []Wait{{Call: "create_order", Token: 6}}, Seq: 6},
+		Actions: []Action{{Kind: Call, Name: "create_order", Token: 6, Outcomes: true}, {Kind: Send, Name: "placing"}},
+	}
+	if err != nil || !reflect.DeepEqual(r, want) {
+		t.Fatalf("payment:success = %s, %v", dump(r), err)
+	}
+	placing := r.Snapshot
+	// A stale token: nothing changes.
+	if r, err := b.Outcome(placing, "create_order", "created", 5, nil); err != nil ||
+		!reflect.DeepEqual(r.Snapshot, placing) || len(r.Actions) != 0 {
+		t.Fatalf("stale outcome = %s, %v", dump(r), err)
+	}
+	// The token of the call: handled by the root's arrows, the wait is gone.
+	r, err = b.Outcome(placing, "create_order", "created", 6, nil)
+	if err != nil || r.Snapshot.At != "done" || r.Snapshot.Pending != nil ||
+		!reflect.DeepEqual(r.Actions, []Action{{Kind: Call, Name: "notify_kitchen", Detached: true}, {Kind: Send, Name: "done"}}) {
+		t.Fatalf("outcome = %s, %v", dump(r), err)
+	}
+	// Delivered again: the wait is gone, nothing changes.
+	if again, err := b.Outcome(r.Snapshot, "create_order", "created", 6, nil); err != nil ||
+		!reflect.DeepEqual(again.Snapshot, r.Snapshot) || len(again.Actions) != 0 {
+		t.Fatalf("repeated outcome = %s, %v", dump(again), err)
+	}
+	// rejected depends on a condition: Need, then Decide.
+	r, err = Decide(nil, func(c string) (bool, error) { return c == "address_rejected", nil },
+		func(g map[string]bool) (*Result, error) { return b.Outcome(placing, "create_order", "rejected", 6, g) })
+	if err != nil || r.Snapshot.At != "address" {
+		t.Fatalf("Decide(rejected) = %s, %v", dump(r), err)
+	}
+	// A malformed outcome is refused before it is sent; an outcome without a token of the call is
+	// a bad_request of the engine.
+	for _, c := range [][2]string{{"", "created"}, {"create_order", ""}, {"create_order", "a:b"}} {
+		if _, err := b.Outcome(placing, c[0], c[1], 6, nil); err == nil {
+			t.Errorf("Outcome(%q, %q) accepted", c[0], c[1])
+		}
+	}
+	if _, err := b.Step(placing, "call:create_order:created", nil); !isCode(err, CodeBadRequest) {
+		t.Fatalf("outcome event without a token: %v", err)
+	}
+	// restart clears the waits.
+	if r, err := b.Restart(placing); err != nil || r.Snapshot.Pending != nil {
+		t.Fatalf("Restart = %s, %v", dump(r), err)
+	}
+}
+
+// Under a request size limit the engine refuses a step whose new snapshot would not fit into the
+// next request, and the stored snapshot still works for its outcomes.
+func TestSnapshotTooLarge(t *testing.T) {
+	b := load(t, "features.bot.json")
+	s := Snapshot{At: "home", Seq: 10000}
+	for i := 0; i < 2000; i++ {
+		s.Pending = append(s.Pending, Wait{Call: "ping", Token: uint64(9999 - i)})
+	}
+	prev := SetMaxRequest(65536)
+	defer SetMaxRequest(prev)
+	// The user keeps pressing a button whose action waits for every outcome, and none comes.
+	var err error
+	for i := 0; i < 1000; i++ {
+		var r *Result
+		if r, err = b.Step(s, "btn:ping", nil); err != nil {
+			break
+		}
+		s = r.Snapshot
+	}
+	if !isCode(err, CodeSnapshotTooLarge) {
+		t.Fatalf("growing steps: %v", err)
+	}
+	stored, _ := json.Marshal(s)
+	if len(stored) > 65536*15/16 {
+		t.Fatalf("the engine wrote a snapshot of %d bytes", len(stored))
+	}
+	// The last snapshot the engine wrote still carries its outcomes and restart.
+	n := len(s.Pending)
+	if r, err := b.Outcome(s, "ping", "pong", s.Pending[n-1].Token, nil); err != nil || len(r.Snapshot.Pending) != n-1 {
+		t.Fatalf("outcome with the stored snapshot: %v", err)
+	}
+	if r, err := b.Restart(s); err != nil || r.Snapshot.Pending != nil {
+		t.Fatalf("restart with the stored snapshot: %v", err)
+	}
+}
+
+// A reply is exactly one JSON value: any text after it is an error.
+func TestDecodeJSON(t *testing.T) {
+	for _, ok := range []string{`{"a":1}`, "{\"a\":1} \t\r\n", `[1]`} {
+		if _, err := decodeJSON([]byte(ok)); err != nil {
+			t.Errorf("decodeJSON(%q): %v", ok, err)
+		}
+	}
+	for _, bad := range []string{`{"a":1}}`, `{"a":1}]`, `{"a":1} x`, `{"a":1}{}`, `{"a":1} 1`, ``} {
+		if _, err := decodeJSON([]byte(bad)); err == nil {
+			t.Errorf("decodeJSON(%q) accepted", bad)
+		}
+	}
+}
+
+// Timer takes guards and Need like Step.
+func TestTimerGuards(t *testing.T) {
+	b, err := Load(`{"figram": 1, "conditions": {"ok": "ok"}, "bot": {"initial": "a", "children": {
+		"a": {"timers": {"t": 5}, "on": {"timer:t": [{"if": "ok", "to": "b"}, {"to": "c"}], "btn:c": [{"to": "c"}]}},
+		"b": {"on": {"btn:a": [{"to": "a"}]}}, "c": {"on": {"btn:a": [{"to": "a"}]}}}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	start, err := b.Start(0)
+	if err != nil || start.Snapshot.Timers["t"] != 1 {
+		t.Fatalf("Start = %s, %v", dump(start), err)
+	}
+	r, err := b.Timer(start.Snapshot, "t", 1, nil)
+	if err != nil || !reflect.DeepEqual(r.Need, []string{"ok"}) {
+		t.Fatalf("Timer without guards = %s, %v", dump(r), err)
+	}
+	for v, at := range map[bool]string{true: "b", false: "c"} {
+		r, err := Decide(map[string]bool{"ok": v}, func(string) (bool, error) { return false, errors.New("asked") },
+			func(g map[string]bool) (*Result, error) { return b.Timer(start.Snapshot, "t", 1, g) })
+		if err != nil || r.Snapshot.At != at {
+			t.Errorf("Timer with ok=%v = %s, %v", v, dump(r), err)
+		}
+	}
+}
+
+// The name of an action with outcomes may contain ':' (the outcome may not).
+func TestOutcomeColonAction(t *testing.T) {
+	b, err := Load(`{"figram": 1, "calls": {"crm:create": {"text": "create", "outcomes": ["ok"]}},
+		"bot": {"initial": "a", "on": {"call:crm:create:ok": [{"to": "b"}], "call:crm:create:failed": [{}]},
+		"children": {"a": {"on": {"btn:go": [{"do": ["crm:create"]}]}}, "b": {"on": {"btn:a": [{"to": "a"}]}}}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	start, _ := b.Start(0)
+	r, err := b.Step(start.Snapshot, "btn:go", nil)
+	if err != nil || len(r.Actions) != 1 || r.Actions[0].Name != "crm:create" || !r.Actions[0].Outcomes {
+		t.Fatalf("btn:go = %s, %v", dump(r), err)
+	}
+	r, err = b.Outcome(r.Snapshot, "crm:create", "ok", r.Actions[0].Token, nil)
+	if err != nil || r.Snapshot.At != "b" || r.Snapshot.Pending != nil {
+		t.Fatalf("Outcome = %s, %v", dump(r), err)
+	}
+}
+
+// The snapshot limit holds for names that encoding/json would escape: the request is encoded as
+// the engine encodes it, so the last snapshot the engine wrote still fits into the next request.
+func TestSnapshotTooLargeEscapedNames(t *testing.T) {
+	for _, name := range []string{"<ping>&co", "ping\u2028\u2029"} {
+		doc := `{"figram": 1, "calls": {"` + name + `": {"text": "x", "outcomes": ["pong"], "every": true}},
+			"bot": {"initial": "home", "on": {"call:` + name + `:pong": [{}], "call:` + name + `:failed": [{}]},
+			"children": {"home": {"on": {"btn:ping": [{"do": ["` + name + `"]}]}}}}}`
+		b, err := Load(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prev := SetMaxRequest(12000)
+		s := Snapshot{At: "home", Seq: 1}
+		for i := 0; i < 2000; i++ {
+			var r *Result
+			if r, err = b.Step(s, "btn:ping", nil); err != nil {
+				break
+			}
+			s = r.Snapshot
+		}
+		if !isCode(err, CodeSnapshotTooLarge) {
+			t.Errorf("%q: growing steps end with %v, want snapshot_too_large", name, err)
+		}
+		n := len(s.Pending)
+		if r, err := b.Outcome(s, name, "pong", s.Pending[n-1].Token, nil); err != nil || len(r.Snapshot.Pending) != n-1 {
+			t.Errorf("%q: outcome with the last stored snapshot: %v", name, err)
+		}
+		if _, err := b.Restart(s); err != nil {
+			t.Errorf("%q: restart with the last stored snapshot: %v", name, err)
+		}
+		SetMaxRequest(prev)
+		b.Close()
+	}
+}
+
+// A request is encoded as the engine encodes JSON: no HTML escapes, U+2028/U+2029 as UTF-8; an
+// escaped backslash before "u2028" stays as it is.
+func TestEncodeLine(t *testing.T) {
+	b, err := encodeLine(map[string]any{"e": "a<&>\u2028\u2029\\u2028\"q"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "{\"e\":\"a<&>\u2028\u2029\\\\u2028\\\"q\"}"; string(b) != want {
+		t.Fatalf("encodeLine = %s, want %s", b, want)
+	}
+}
+
+// Invalid UTF-8 in a request is refused before it is sent, as the library refuses a raw request.
+func TestInvalidUTF8(t *testing.T) {
+	b := load(t, "pizza.bot.json")
+	menu := Snapshot{At: "menu", Seq: 1}
+	cases := map[string]error{
+		"event":    second(b.Step(menu, "btn:\xff", nil)),
+		"snapshot": second(b.Step(Snapshot{At: "men\xff"}, "btn:order", nil)),
+		"guard":    second(b.Step(menu, "btn:order", map[string]bool{"c\xff": true})),
+		"resume":   second(b.Step(Snapshot{At: "menu", Resume: map[string]string{"order": "x\xff"}}, "btn:order", nil)),
+		"outcome":  second(b.Outcome(menu, "create\xff", "ok", 1, nil)),
+		"start":    second(b.StartWith(0, "btn:\xff", nil)),
+	}
+	for name, err := range cases {
+		if !isCode(err, CodeParseError) {
+			t.Errorf("%s: %v, want parse_error", name, err)
+		}
+	}
+	if out, err := b.Request([]byte(`{"id":1,"op":"step","snapshot":{"at":"menu"},"event":"btn:` + "\xff" + `"}`)); err != nil ||
+		!strings.Contains(string(out), "parse_error") {
+		t.Fatalf("raw request with invalid UTF-8: %s, %v", out, err)
 	}
 }
 
@@ -476,8 +706,9 @@ func TestCheckReply(t *testing.T) {
 		{"step", `{"id":null,"error":"x","code":"bad_request"}`, "ERR"},
 		{"step", `{"id":6,"error":"x","code":"bad_request"}`, "ERR"},
 		{"step", `{"id":5,"error":"x"}`, "ERR"},
-		{"hello", `{"id":5,"protocol":2,"states":11}`, "hello"},
-		{"hello", `{"id":5,"protocol":2,"states":11,"mutant":"x"}`, "ERR"},
+		{"hello", `{"id":5,"protocol":3,"states":11}`, "hello"},
+		{"hello", `{"id":5,"protocol":3,"states":11,"mutant":"x"}`, "ERR"},
+		{"step", `{"id":5,"error":"x","code":"snapshot_too_large"}`, "error"},
 		{"hello", `{"id":5,"protocol":1.5,"states":11}`, "ERR"},
 		{"start", `{"id":5,"snapshot":{"at":"menu","seq":8},"actions":[{"send":"menu"}]}`, "result"},
 		{"start", `{"id":"5","snapshot":{"at":"menu","seq":8},"actions":[]}`, "ERR"},
@@ -501,6 +732,44 @@ func TestCheckReply(t *testing.T) {
 		{"step", `{"id":5,"snapshot":{"at":"vip","back":"","seq":1},"actions":[]}`, "ERR"},
 		{"step", `{"id":5,"snapshot":{"at":"vip","back":1,"seq":1},"actions":[]}`, "ERR"},
 		{"step", `{"id":5,"snapshot":{"at":"vip","back":null,"seq":1},"actions":[]}`, "ERR"},
+		// Protocol 3: waits for outcomes in the snapshot, a list of exactly {call, token}.
+		{"step", `{"id":5,"snapshot":{"at":"item","pending":[{"call":"check_stock","token":6}],"seq":6},"actions":[]}`, "result"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":[{"call":"ping","token":7},{"call":"ping","token":6}],"seq":7},"actions":[]}`, "result"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":[]},"actions":[]}`, "result"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":[{"call":"ping"}]},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":[{"call":"","token":1}]},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":[{"call":"ping","token":-1}]},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":[{"call":"ping","token":"1"}]},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":[{"call":"ping","token":1,"x":1}]},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":{"ping":1}},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","pending":null},"actions":[]}`, "ERR"},
+		// Protocol 3: call carries token (an action with outcomes) and detached (a background action).
+		{"step", `{"id":5,"snapshot":{"at":"item","seq":6},"actions":[{"call":"check_stock","token":6}]}`, "result"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"call":"log","detached":true}]}`, "result"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"call":"ping","token":1,"detached":true}]}`, "result"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"call":"log","detached":false}]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"call":"log","detached":1}]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"call":"ping","token":1.5}]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"call":"","token":1}]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"call":"ping","token":1,"outcome":"pong"}]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"send":"home","detached":true}]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"home","seq":1},"actions":[{"send":"home","token":1}]}`, "ERR"},
+		// Every field of a snapshot, hello and need is checked.
+		{"step", `{"id":5,"snapshot":{"seq":1},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":""},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"a","v":1},"actions":[]}`, "result"},
+		{"step", `{"id":5,"snapshot":{"at":"a","v":2},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"a","resume":{"s":""}},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"a","resume":["s"]},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"a","timers":{"t":-1}},"actions":[]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"a","timers":{"t":"1"}},"actions":[]}`, "ERR"},
+		{"hello", `{"id":5,"protocol":3,"states":-1}`, "ERR"},
+		{"hello", `{"id":5,"protocol":3,"states":"3"}`, "ERR"},
+		{"step", `{"id":5,"need":["c",""]}`, "ERR"},
+		{"step", `{"id":5,"need":[1]}`, "ERR"},
+		{"step", `{"id":5,"need":["c","c"]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"a"},"actions":[{"start_timer":"t","ms":1,"token":"1"}]}`, "ERR"},
+		{"step", `{"id":5,"snapshot":{"at":"a"},"actions":[{"start_timer":"t","ms":"1","token":1}]}`, "ERR"},
 	}
 	for _, c := range cases {
 		v, err := decodeJSON([]byte(c.reply))
